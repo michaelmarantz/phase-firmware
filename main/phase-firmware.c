@@ -23,7 +23,7 @@
 
 // ── Hardware config ────────────────────────────────────────
 #define LED_GPIO        2
-#define LED_COUNT       52
+#define LED_COUNT       90
 #define LED_RMT_RES_HZ  10000000
 
 // ── LED color (warm white) ─────────────────────────────────
@@ -32,7 +32,7 @@
 #define WARM_B  40
 
 // ── Firmware version ───────────────────────────────────────
-#define FW_VERSION  "prototype-02.1"
+#define FW_VERSION  "prototype-04"
 
 // ── Rendering defaults ─────────────────────────────────────
 #define GRADIENT_WIDTH         0.28f
@@ -269,7 +269,7 @@ static float apply_curve(float phase)
 
 static float led_angle(int i)
 {
-    return fmodf((i + 1) * (360.0f / 52.0f), 360.0f);
+    return fmodf((i + 1) * (360.0f / (float)LED_COUNT), 360.0f);
 }
 
 static float   glimmer_offset[LED_COUNT];

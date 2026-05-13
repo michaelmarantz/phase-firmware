@@ -5,7 +5,7 @@ ESP-IDF firmware for the Phase lamp — an ESP32-C3 driving a ring of WS2812 LED
 ## Hardware
 
 - **MCU:** ESP32-C3 (RISC-V, 2 MB flash)
-- **LEDs:** 52× WS2812 on GPIO 2, driven via RMT at 10 MHz
+- **LEDs:** 90× WS2812 on GPIO 2, driven via RMT at 10 MHz (prototype-02.x used 52)
 - **Color:** warm white (R=255, G=120, B=40), brightness/floor/glimmer modulated per pixel
 
 ## Project conventions
