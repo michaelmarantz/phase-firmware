@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -30,29 +31,41 @@
 #define WARM_G  120
 #define WARM_B  40
 
+// ── Firmware version ───────────────────────────────────────
+#define FW_VERSION  "prototype-02.1"
+
 // ── Rendering defaults ─────────────────────────────────────
 #define GRADIENT_WIDTH         0.28f
-#define DEFAULT_GLIMMER_BASE   0.22f
-#define DEFAULT_GLIMMER_EDGE   0.60f
-#define DEFAULT_GLIMMER_SPEED  0.40f
 #define DEFAULT_FACE_GRADIENT  0.45f
 #define DEFAULT_BRIGHTNESS     1.0f
-#define DEFAULT_CURVE_Q1       0.50f
-#define DEFAULT_CURVE_G1       0.75f
-#define DEFAULT_CURVE_G3       0.75f
-#define DEFAULT_CURVE_Q3       0.50f
+#define DEFAULT_FLOOR          0.15f
+#define DEFAULT_GLIMMER_ON     false
+#define DEFAULT_GLIMMER_BASE   0.10f
+#define DEFAULT_GLIMMER_EDGE   0.30f
+#define DEFAULT_GLIMMER_SPEED  0.30f
+#define DEFAULT_CURVE_Q1       0.259f
+#define DEFAULT_CURVE_G1       0.501f
+#define DEFAULT_CURVE_G3       0.500f
+#define DEFAULT_CURVE_Q3       0.255f
 
 // ── Internal ───────────────────────────────────────────────
 #define TAG "phase"
 static EventGroupHandle_t wifi_events;
 #define WIFI_CONNECTED_BIT BIT0
 
+// Serialises led_strip_refresh() against any flash-touching code (NVS commit).
+// Flash ops disable the CPU cache, which can stall the RMT refill ISR and
+// corrupt the WS2812 frame mid-transmit.
+static SemaphoreHandle_t led_mutex;
+
 // ── Live params ────────────────────────────────────────────
+static float p_face_gradient = DEFAULT_FACE_GRADIENT;
+static float p_brightness    = DEFAULT_BRIGHTNESS;
+static float p_floor         = DEFAULT_FLOOR;
+static bool  p_glimmer_on    = DEFAULT_GLIMMER_ON;
 static float p_glimmer_base  = DEFAULT_GLIMMER_BASE;
 static float p_glimmer_edge  = DEFAULT_GLIMMER_EDGE;
 static float p_glimmer_speed = DEFAULT_GLIMMER_SPEED;
-static float p_face_gradient = DEFAULT_FACE_GRADIENT;
-static float p_brightness    = DEFAULT_BRIGHTNESS;
 static float p_curve_q1      = DEFAULT_CURVE_Q1;
 static float p_curve_g1      = DEFAULT_CURVE_G1;
 static float p_curve_g3      = DEFAULT_CURVE_G3;
@@ -68,19 +81,28 @@ static float manual_phase = 0.0f;
 
 static void nvs_save_params(void)
 {
+    // Hold the LED mutex across the entire flash transaction. NVS commit
+    // disables cache, which would otherwise stall the RMT ISR mid-frame.
+    xSemaphoreTake(led_mutex, portMAX_DELAY);
     nvs_handle_t h;
-    if (nvs_open("phase", NVS_READWRITE, &h) != ESP_OK) return;
+    if (nvs_open("phase", NVS_READWRITE, &h) != ESP_OK) {
+        xSemaphoreGive(led_mutex);
+        return;
+    }
+    nvs_set_i32(h, "face_gradient", (int32_t)(p_face_gradient * 1000));
+    nvs_set_i32(h, "brightness",    (int32_t)(p_brightness    * 1000));
+    nvs_set_i32(h, "floor",         (int32_t)(p_floor         * 1000));
+    nvs_set_i32(h, "glimmer_on",    p_glimmer_on ? 1 : 0);
     nvs_set_i32(h, "glimmer_base",  (int32_t)(p_glimmer_base  * 1000));
     nvs_set_i32(h, "glimmer_edge",  (int32_t)(p_glimmer_edge  * 1000));
     nvs_set_i32(h, "glimmer_speed", (int32_t)(p_glimmer_speed * 1000));
-    nvs_set_i32(h, "face_gradient", (int32_t)(p_face_gradient * 1000));
-    nvs_set_i32(h, "brightness",    (int32_t)(p_brightness    * 1000));
     nvs_set_i32(h, "curve_q1",      (int32_t)(p_curve_q1      * 1000));
     nvs_set_i32(h, "curve_g1",      (int32_t)(p_curve_g1      * 1000));
     nvs_set_i32(h, "curve_g3",      (int32_t)(p_curve_g3      * 1000));
     nvs_set_i32(h, "curve_q3",      (int32_t)(p_curve_q3      * 1000));
     nvs_commit(h);
     nvs_close(h);
+    xSemaphoreGive(led_mutex);
     ESP_LOGI(TAG, "Saved. q1=%.3f g1=%.3f g3=%.3f q3=%.3f",
              p_curve_q1, p_curve_g1, p_curve_g3, p_curve_q3);
 }
@@ -90,11 +112,13 @@ static void nvs_load_params(void)
     nvs_handle_t h;
     if (nvs_open("phase", NVS_READONLY, &h) != ESP_OK) return;
     int32_t v;
+    if (nvs_get_i32(h, "face_gradient", &v) == ESP_OK) p_face_gradient = v / 1000.0f;
+    if (nvs_get_i32(h, "brightness",    &v) == ESP_OK) p_brightness    = v / 1000.0f;
+    if (nvs_get_i32(h, "floor",         &v) == ESP_OK) p_floor         = v / 1000.0f;
+    if (nvs_get_i32(h, "glimmer_on",    &v) == ESP_OK) p_glimmer_on    = (v != 0);
     if (nvs_get_i32(h, "glimmer_base",  &v) == ESP_OK) p_glimmer_base  = v / 1000.0f;
     if (nvs_get_i32(h, "glimmer_edge",  &v) == ESP_OK) p_glimmer_edge  = v / 1000.0f;
     if (nvs_get_i32(h, "glimmer_speed", &v) == ESP_OK) p_glimmer_speed = v / 1000.0f;
-    if (nvs_get_i32(h, "face_gradient", &v) == ESP_OK) p_face_gradient = v / 1000.0f;
-    if (nvs_get_i32(h, "brightness",    &v) == ESP_OK) p_brightness    = v / 1000.0f;
     if (nvs_get_i32(h, "curve_q1",      &v) == ESP_OK) p_curve_q1      = v / 1000.0f;
     if (nvs_get_i32(h, "curve_g1",      &v) == ESP_OK) p_curve_g1      = v / 1000.0f;
     if (nvs_get_i32(h, "curve_g3",      &v) == ESP_OK) p_curve_g3      = v / 1000.0f;
@@ -140,6 +164,9 @@ static void wifi_init(void)
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
     esp_wifi_start();
+    // Disable Wi-Fi modem sleep — on the single-core C3 it lets Wi-Fi ISRs
+    // preempt the RMT refill ISR long enough to corrupt WS2812 frames.
+    esp_wifi_set_ps(WIFI_PS_NONE);
     ESP_LOGI(TAG, "Connecting to Wi-Fi...");
     xEventGroupWaitBits(wifi_events, WIFI_CONNECTED_BIT, false, true, portMAX_DELAY);
 }
@@ -245,8 +272,10 @@ static float led_angle(int i)
     return fmodf((i + 1) * (360.0f / 52.0f), 360.0f);
 }
 
-static float glimmer_offset[LED_COUNT];
-static float glimmer_rate[LED_COUNT];
+static float   glimmer_offset[LED_COUNT];
+static float   glimmer_rate[LED_COUNT];
+static uint8_t last_frame[LED_COUNT][3];
+static bool    last_frame_valid = false;
 
 static void init_glimmer(void)
 {
@@ -258,26 +287,16 @@ static void init_glimmer(void)
 
 static float glimmer_value(int led, float time_f, float edge_proximity)
 {
-    float wave  = sinf(time_f * glimmer_rate[led] + glimmer_offset[led]);
-    float wave2 = sinf(time_f * glimmer_rate[led] * 0.37f + glimmer_offset[led] * 1.3f);
+    float wave     = sinf(time_f * glimmer_rate[led] + glimmer_offset[led]);
+    float wave2    = sinf(time_f * glimmer_rate[led] * 0.37f + glimmer_offset[led] * 1.3f);
     float combined = wave * 0.7f + wave2 * 0.3f;
-    float amount = p_glimmer_base + edge_proximity * p_glimmer_edge;
+    float amount   = p_glimmer_base + edge_proximity * p_glimmer_edge;
     return 1.0f - amount * (0.5f + 0.5f * combined);
 }
 
 static void render_moon(led_strip_handle_t strip, float phase, float time_f)
 {
     float lit_arc = apply_curve(phase);
-
-    // Full moon blend: entire ring lit with subtle shimmer near phase 0.5
-    float fm_blend = 0.0f;
-    float fm_start = 0.47f, fm_end = 0.53f;
-    if (phase >= fm_start && phase <= fm_end) {
-        float mid  = (fm_start + fm_end) * 0.5f;
-        float half = (fm_end - fm_start) * 0.5f;
-        float d    = fabsf(phase - mid) / half;
-        fm_blend   = 1.0f - d * d * (3.0f - 2.0f * d);
-    }
 
     // Smooth the lit_center flip around full moon
     float lit_center;
@@ -296,6 +315,8 @@ static void render_moon(led_strip_handle_t strip, float phase, float time_f)
     float max_gradient = lit_arc * 0.25f;
     if (gradient_deg > max_gradient) gradient_deg = max_gradient;
 
+    uint8_t new_frame[LED_COUNT][3];
+
     for (int i = 0; i < LED_COUNT; i++) {
         float angle = led_angle(i);
         float rel   = angle - lit_center;
@@ -311,40 +332,46 @@ static void render_moon(led_strip_handle_t strip, float phase, float time_f)
             float depth = 0.0f;
             if (half_arc > 0.0f) depth = (-dist) / half_arc;
             if (depth > 1.0f) depth = 1.0f;
-            brightness     = 1.0f - depth * p_face_gradient;
-            edge_proximity = 0.0f;
+            brightness = 1.0f - depth * p_face_gradient;
         } else if (dist > gradient_deg) {
-            brightness     = 0.0f;
-            edge_proximity = 0.0f;
+            brightness = 0.0f;
         } else {
             float t        = dist / gradient_deg;
             brightness     = 0.5f - 0.5f * sinf(t * ((float)M_PI / 2.0f));
             edge_proximity = 1.0f - fabsf(t);
         }
 
-        if (brightness > 0.01f)
+        if (p_glimmer_on && brightness > 0.01f)
             brightness *= glimmer_value(i, time_f, edge_proximity);
 
         brightness *= p_brightness;
+        if (brightness < p_floor) brightness = 0.0f;
 
-        // Blend toward full-moon mode (all LEDs lit with subtle body shimmer)
-        if (fm_blend > 0.0f) {
-            float fm_bright = p_brightness * glimmer_value(i, time_f, 0.0f);
-            brightness = brightness + fm_blend * (fm_bright - brightness);
-        }
-
-        // Smooth fade near floor to prevent pixel pops from glimmer oscillation
-        if (brightness > 0.0f && brightness < 0.10f) {
-            brightness *= brightness / 0.10f;
-        }
-        if (brightness < 0.04f) brightness = 0.0f;
-
-        led_strip_set_pixel(strip, i,
-            (uint8_t)(WARM_R * brightness),
-            (uint8_t)(WARM_G * brightness),
-            (uint8_t)(WARM_B * brightness));
+        new_frame[i][0] = (uint8_t)(WARM_R * brightness);
+        new_frame[i][1] = (uint8_t)(WARM_G * brightness);
+        new_frame[i][2] = (uint8_t)(WARM_B * brightness);
     }
-    led_strip_refresh(strip);
+
+    // Skip refresh if frame is identical to last — fewer transmissions,
+    // fewer chances for the data line to latch a corrupted byte.
+    bool changed = !last_frame_valid;
+    if (last_frame_valid) {
+        if (memcmp(new_frame, last_frame, sizeof(new_frame)) != 0) {
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        xSemaphoreTake(led_mutex, portMAX_DELAY);
+        for (int i = 0; i < LED_COUNT; i++) {
+            led_strip_set_pixel(strip, i,
+                new_frame[i][0], new_frame[i][1], new_frame[i][2]);
+        }
+        led_strip_refresh(strip);
+        xSemaphoreGive(led_mutex);
+        memcpy(last_frame, new_frame, sizeof(new_frame));
+        last_frame_valid = true;
+    }
 }
 
 // ──────────────────────────────────────────────────────────
@@ -427,17 +454,32 @@ static const char *HTML_PAGE =
 "<div class='section-title'>Rendering Parameters</div>"
 "<label>Brightness<span id='lbl-bright'></span></label>"
 "<input type='range' id='s-bright' min='100' max='1000' oninput='onParam()'/>"
-"<label>Glimmer &mdash; body<span id='lbl-base'></span></label>"
-"<input type='range' id='s-base' min='0' max='500' oninput='onParam()'/>"
-"<label>Glimmer &mdash; edge<span id='lbl-edge'></span></label>"
-"<input type='range' id='s-edge' min='0' max='1000' oninput='onParam()'/>"
-"<label>Glimmer speed<span id='lbl-speed'></span></label>"
-"<input type='range' id='s-speed' min='50' max='2000' oninput='onParam()'/>"
 "<label>Face gradient<span id='lbl-grad'></span></label>"
 "<input type='range' id='s-grad' min='0' max='900' oninput='onParam()'/>"
+"<label>Brightness floor (debug)<span id='lbl-floor'></span></label>"
+"<input type='range' id='s-floor' min='0' max='500' oninput='onParam()'/>"
+"<div class='note'>Cut-off for the lowest brightness pixels. Raise to fix terminator flicker, lower for a softer edge.</div>"
+"<hr/>"
+"<div class='section-title'>Glimmer (debug)</div>"
+"<div class='mode-row'>"
+"<button class='mode-btn active' id='btn-gon-off' onclick='setGlimmer(false)'>Off</button>"
+"<button class='mode-btn' id='btn-gon-on' onclick='setGlimmer(true)'>On</button>"
+"</div>"
+"<div class='controls' id='glimmer-controls'>"
+"<label>Body shimmer<span id='lbl-gbase'></span></label>"
+"<input type='range' id='s-gbase' min='0' max='500' oninput='onParam()'/>"
+"<div class='note'>Subtle brightness wobble across the lit face.</div>"
+"<label>Edge shimmer<span id='lbl-gedge'></span></label>"
+"<input type='range' id='s-gedge' min='0' max='1000' oninput='onParam()'/>"
+"<div class='note'>Extra wobble near the terminator. May reintroduce flicker if data line is noisy.</div>"
+"<label>Speed<span id='lbl-gspeed'></span></label>"
+"<input type='range' id='s-gspeed' min='50' max='2000' oninput='onParam()'/>"
+"<div class='note'>How fast the shimmer oscillates.</div>"
+"</div>"
 "<button class='save-btn' onclick='saveParams()'>Save to Device</button>"
 "<div class='saved-msg' id='saved-msg'>Saved.</div>"
 "<div class='status' id='status'>—</div>"
+"<div class='status'>firmware " FW_VERSION "</div>"
 "</div>"
 "<script>"
 "var isManual=false;"
@@ -483,24 +525,31 @@ static const char *HTML_PAGE =
 "var g3=document.getElementById('s-g3').value/1000.0;"
 "var q3=document.getElementById('s-q3').value/1000.0;"
 "var bright=document.getElementById('s-bright').value/1000.0;"
-"var base=document.getElementById('s-base').value/1000.0;"
-"var edge=document.getElementById('s-edge').value/1000.0;"
-"var speed=document.getElementById('s-speed').value/1000.0;"
 "var grad=document.getElementById('s-grad').value/1000.0;"
+"var floor=document.getElementById('s-floor').value/1000.0;"
+"var gbase=document.getElementById('s-gbase').value/1000.0;"
+"var gedge=document.getElementById('s-gedge').value/1000.0;"
+"var gspeed=document.getElementById('s-gspeed').value/1000.0;"
 "document.getElementById('lbl-q1').textContent=q1.toFixed(3);"
 "document.getElementById('lbl-g1').textContent=g1.toFixed(3);"
 "document.getElementById('lbl-g3').textContent=g3.toFixed(3);"
 "document.getElementById('lbl-q3').textContent=q3.toFixed(3);"
 "document.getElementById('lbl-bright').textContent=bright.toFixed(3);"
-"document.getElementById('lbl-base').textContent=base.toFixed(3);"
-"document.getElementById('lbl-edge').textContent=edge.toFixed(3);"
-"document.getElementById('lbl-speed').textContent=speed.toFixed(3);"
 "document.getElementById('lbl-grad').textContent=grad.toFixed(3);"
+"document.getElementById('lbl-floor').textContent=floor.toFixed(3);"
+"document.getElementById('lbl-gbase').textContent=gbase.toFixed(3);"
+"document.getElementById('lbl-gedge').textContent=gedge.toFixed(3);"
+"document.getElementById('lbl-gspeed').textContent=gspeed.toFixed(3);"
 "fetch('/params?q1='+q1.toFixed(3)+'&g1='+g1.toFixed(3)"
 "+'&g3='+g3.toFixed(3)+'&q3='+q3.toFixed(3)"
-"+'&bright='+bright.toFixed(3)+'&base='+base.toFixed(3)"
-"+'&edge='+edge.toFixed(3)+'&speed='+speed.toFixed(3)"
-"+'&grad='+grad.toFixed(3)).catch(function(){});}"
+"+'&bright='+bright.toFixed(3)+'&grad='+grad.toFixed(3)"
+"+'&floor='+floor.toFixed(3)"
+"+'&gbase='+gbase.toFixed(3)+'&gedge='+gedge.toFixed(3)"
+"+'&gspeed='+gspeed.toFixed(3)).catch(function(){});}"
+"function setGlimmer(on){"
+"document.getElementById('btn-gon-off').classList.toggle('active',!on);"
+"document.getElementById('btn-gon-on').classList.toggle('active',on);"
+"fetch('/params?gon='+(on?'1':'0')).catch(function(){});}"
 "function saveParams(){"
 "fetch('/params/save').then(function(){"
 "var m=document.getElementById('saved-msg');"
@@ -517,19 +566,23 @@ static const char *HTML_PAGE =
 "document.getElementById('s-g3').value=Math.round(d.g3*1000);"
 "document.getElementById('s-q3').value=Math.round(d.q3*1000);"
 "document.getElementById('s-bright').value=Math.round(d.bright*1000);"
-"document.getElementById('s-base').value=Math.round(d.base*1000);"
-"document.getElementById('s-edge').value=Math.round(d.edge*1000);"
-"document.getElementById('s-speed').value=Math.round(d.speed*1000);"
 "document.getElementById('s-grad').value=Math.round(d.grad*1000);"
+"document.getElementById('s-floor').value=Math.round(d.floor*1000);"
+"document.getElementById('s-gbase').value=Math.round(d.gbase*1000);"
+"document.getElementById('s-gedge').value=Math.round(d.gedge*1000);"
+"document.getElementById('s-gspeed').value=Math.round(d.gspeed*1000);"
+"document.getElementById('btn-gon-off').classList.toggle('active',!d.gon);"
+"document.getElementById('btn-gon-on').classList.toggle('active',d.gon);"
 "document.getElementById('lbl-q1').textContent=d.q1.toFixed(3);"
 "document.getElementById('lbl-g1').textContent=d.g1.toFixed(3);"
 "document.getElementById('lbl-g3').textContent=d.g3.toFixed(3);"
 "document.getElementById('lbl-q3').textContent=d.q3.toFixed(3);"
 "document.getElementById('lbl-bright').textContent=d.bright.toFixed(3);"
-"document.getElementById('lbl-base').textContent=d.base.toFixed(3);"
-"document.getElementById('lbl-edge').textContent=d.edge.toFixed(3);"
-"document.getElementById('lbl-speed').textContent=d.speed.toFixed(3);"
 "document.getElementById('lbl-grad').textContent=d.grad.toFixed(3);"
+"document.getElementById('lbl-floor').textContent=d.floor.toFixed(3);"
+"document.getElementById('lbl-gbase').textContent=d.gbase.toFixed(3);"
+"document.getElementById('lbl-gedge').textContent=d.gedge.toFixed(3);"
+"document.getElementById('lbl-gspeed').textContent=d.gspeed.toFixed(3);"
 "}).catch(function(){});}"
 "poll();setInterval(poll,5000);"
 "</script></body></html>";
@@ -551,16 +604,19 @@ static esp_err_t handle_status(httpd_req_t *req)
     if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK)
         snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
 
-    char buf[400];
+    char buf[512];
     snprintf(buf, sizeof(buf),
         "{\"phase\":%.4f,\"illumination\":%.1f,\"name\":\"%s\","
         "\"manual\":%s,\"ip\":\"%s\","
         "\"q1\":%.3f,\"g1\":%.3f,\"g3\":%.3f,\"q3\":%.3f,"
-        "\"bright\":%.3f,\"base\":%.3f,\"edge\":%.3f,\"speed\":%.3f,\"grad\":%.3f}",
+        "\"bright\":%.3f,\"grad\":%.3f,\"floor\":%.3f,"
+        "\"gon\":%s,\"gbase\":%.3f,\"gedge\":%.3f,\"gspeed\":%.3f}",
         phase, ill * 100.0f, phase_name(phase),
         manual_mode ? "true" : "false", ip_str,
         p_curve_q1, p_curve_g1, p_curve_g3, p_curve_q3,
-        p_brightness, p_glimmer_base, p_glimmer_edge, p_glimmer_speed, p_face_gradient);
+        p_brightness, p_face_gradient, p_floor,
+        p_glimmer_on ? "true" : "false",
+        p_glimmer_base, p_glimmer_edge, p_glimmer_speed);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, strlen(buf));
@@ -599,10 +655,12 @@ static esp_err_t handle_params(httpd_req_t *req)
         if (httpd_query_key_value(query, "g3",    val, sizeof(val)) == ESP_OK) p_curve_g3      = strtof(val, NULL);
         if (httpd_query_key_value(query, "q3",    val, sizeof(val)) == ESP_OK) p_curve_q3      = strtof(val, NULL);
         if (httpd_query_key_value(query, "bright",val, sizeof(val)) == ESP_OK) p_brightness    = strtof(val, NULL);
-        if (httpd_query_key_value(query, "base",  val, sizeof(val)) == ESP_OK) p_glimmer_base  = strtof(val, NULL);
-        if (httpd_query_key_value(query, "edge",  val, sizeof(val)) == ESP_OK) p_glimmer_edge  = strtof(val, NULL);
-        if (httpd_query_key_value(query, "speed", val, sizeof(val)) == ESP_OK) p_glimmer_speed = strtof(val, NULL);
         if (httpd_query_key_value(query, "grad",  val, sizeof(val)) == ESP_OK) p_face_gradient = strtof(val, NULL);
+        if (httpd_query_key_value(query, "floor", val, sizeof(val)) == ESP_OK) p_floor         = strtof(val, NULL);
+        if (httpd_query_key_value(query, "gon",   val, sizeof(val)) == ESP_OK) p_glimmer_on    = (strcmp(val, "1") == 0);
+        if (httpd_query_key_value(query, "gbase", val, sizeof(val)) == ESP_OK) p_glimmer_base  = strtof(val, NULL);
+        if (httpd_query_key_value(query, "gedge", val, sizeof(val)) == ESP_OK) p_glimmer_edge  = strtof(val, NULL);
+        if (httpd_query_key_value(query, "gspeed",val, sizeof(val)) == ESP_OK) p_glimmer_speed = strtof(val, NULL);
     }
     httpd_resp_send(req, "ok", 2);
     return ESP_OK;
@@ -638,8 +696,24 @@ static void start_webserver(void)
 // Main
 // ──────────────────────────────────────────────────────────
 
+static void render_task(void *arg)
+{
+    led_strip_handle_t strip = (led_strip_handle_t)arg;
+    float time_f = 0.0f;
+    while (1) {
+        float current_phase = manual_mode ? manual_phase : calc_moon_phase();
+        render_moon(strip, current_phase, time_f);
+        time_f += (p_glimmer_speed * 0.001f) * 50.0f;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
 void app_main(void)
 {
+    ESP_LOGI(TAG, "Phase firmware version: %s", FW_VERSION);
+
+    led_mutex = xSemaphoreCreateMutex();
+
     nvs_flash_init();
     nvs_load_params();
 
@@ -648,7 +722,11 @@ void app_main(void)
         .max_leds       = LED_COUNT,
     };
     led_strip_rmt_config_t rmt_config = {
-        .resolution_hz = LED_RMT_RES_HZ,
+        .resolution_hz     = LED_RMT_RES_HZ,
+        // Larger RMT FIFO = more slack before a delayed refill ISR corrupts the
+        // frame. Default 64 is marginal on C3 with Wi-Fi running; 128 fits in
+        // one channel's symbol memory.
+        .mem_block_symbols = 128,
     };
     led_strip_handle_t strip;
     led_strip_new_rmt_device(&strip_config, &rmt_config, &strip);
@@ -663,12 +741,9 @@ void app_main(void)
              phase, phase_name(phase),
              phase_to_illumination(phase) * 100.0f);
 
-    float time_f = 0.0f;
-
-    while (1) {
-        float current_phase = manual_mode ? manual_phase : calc_moon_phase();
-        render_moon(strip, current_phase, time_f);
-        time_f += (p_glimmer_speed * 0.001f) * 50.0f;
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
+    // Dedicated, high-priority task so the HTTP server and Wi-Fi housekeeping
+    // can't starve the render loop.
+    xTaskCreate(render_task, "render", 4096, strip,
+                configMAX_PRIORITIES - 3, NULL);
 }
+
