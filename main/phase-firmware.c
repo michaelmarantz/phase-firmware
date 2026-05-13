@@ -22,7 +22,7 @@
 
 // ── Hardware config ────────────────────────────────────────
 #define LED_GPIO        2
-#define LED_COUNT       43
+#define LED_COUNT       52
 #define LED_RMT_RES_HZ  10000000
 
 // ── LED color (warm white) ─────────────────────────────────
@@ -242,7 +242,7 @@ static float apply_curve(float phase)
 
 static float led_angle(int i)
 {
-    return fmodf((i + 1) * (360.0f / 43.0f), 360.0f);
+    return fmodf((i + 1) * (360.0f / 52.0f), 360.0f);
 }
 
 static float glimmer_offset[LED_COUNT];
@@ -268,6 +268,16 @@ static float glimmer_value(int led, float time_f, float edge_proximity)
 static void render_moon(led_strip_handle_t strip, float phase, float time_f)
 {
     float lit_arc = apply_curve(phase);
+
+    // Full moon blend: entire ring lit with subtle shimmer near phase 0.5
+    float fm_blend = 0.0f;
+    float fm_start = 0.47f, fm_end = 0.53f;
+    if (phase >= fm_start && phase <= fm_end) {
+        float mid  = (fm_start + fm_end) * 0.5f;
+        float half = (fm_end - fm_start) * 0.5f;
+        float d    = fabsf(phase - mid) / half;
+        fm_blend   = 1.0f - d * d * (3.0f - 2.0f * d);
+    }
 
     // Smooth the lit_center flip around full moon
     float lit_center;
@@ -317,6 +327,16 @@ static void render_moon(led_strip_handle_t strip, float phase, float time_f)
 
         brightness *= p_brightness;
 
+        // Blend toward full-moon mode (all LEDs lit with subtle body shimmer)
+        if (fm_blend > 0.0f) {
+            float fm_bright = p_brightness * glimmer_value(i, time_f, 0.0f);
+            brightness = brightness + fm_blend * (fm_bright - brightness);
+        }
+
+        // Smooth fade near floor to prevent pixel pops from glimmer oscillation
+        if (brightness > 0.0f && brightness < 0.10f) {
+            brightness *= brightness / 0.10f;
+        }
         if (brightness < 0.04f) brightness = 0.0f;
 
         led_strip_set_pixel(strip, i,
