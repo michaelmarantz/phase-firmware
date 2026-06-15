@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════════════════════
-//  Phase firmware — prototype-03.0 ("edition00")
+//  Phase firmware — edition00
 //
 //  Hardware:
 //    SK6812 RGBW × 138 on GPIO 21, reset button on GPIO 20.
@@ -60,7 +60,7 @@
 #define LED_RMT_RES_HZ   10000000
 
 // ── Identity ───────────────────────────────────────────────
-#define FW_VERSION       "prototype-03.0"
+#define FW_VERSION       "edition00"
 #define AP_SSID          "phase"
 #define MDNS_HOSTNAME    "phase"
 #define MDNS_INSTANCE    "Lunar Objects — Phase"

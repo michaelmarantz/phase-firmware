@@ -1,8 +1,8 @@
 # phase-firmware
 
-ESP-IDF firmware for the Phase lamp — an ESP32-C3 driving a ring of addressable LEDs that renders the current moon phase, with a web UI for live tuning. Branch `prototype-03` ("edition00") is a substantial rework: SK6812 RGBW strip, captive-portal Wi-Fi provisioning, reset button, mDNS, and an auth-gated debug portal.
+ESP-IDF firmware for the Phase lamp — an ESP32-C3 driving a ring of addressable LEDs that renders the current moon phase, with a web UI for live tuning. Branch `edition00` is a substantial rework: SK6812 RGBW strip, captive-portal Wi-Fi provisioning, reset button, mDNS, and an auth-gated debug portal.
 
-## Hardware (prototype-03.0)
+## Hardware (edition00)
 
 - **MCU:** ESP32-C3 (RISC-V, single-core, 2 MB flash)
 - **LEDs:** 138× **SK6812 RGBW** on **GPIO 21**, GRBW byte order, driven via RMT at 10 MHz
@@ -16,7 +16,7 @@ Previous revisions: `prototype-02.x` = 52× WS2812 on GPIO 2; `prototype-04` = 9
 ## Project conventions
 
 - **CMake project name** is `phase-prototype` — stays constant across hardware revisions. Build artifact: `build/phase-prototype.bin`.
-- **Branch name** identifies the hardware revision (`prototype-02.1`, `prototype-03`, `prototype-04`, …). `FW_VERSION` in `main/phase-firmware.c` should match the branch.
+- **Branch name** identifies the hardware revision / edition (`prototype-02.1`, `prototype-04`, `edition00`, …). `FW_VERSION` in `main/phase-firmware.c` should match the branch.
 
 ## Build & flash
 
@@ -31,7 +31,7 @@ idf.py -p /dev/cu.usbmodem101 flash             # writes bootloader + partition 
 
 `idf.py fullclean` after switching branches or changing the cmake project name.
 
-## Boot flow (prototype-03)
+## Boot flow (edition00)
 
 ```
                   ┌──────────────────────────────┐
@@ -85,7 +85,7 @@ Single file (~1100 lines). Sections:
 ## Notes / gotchas
 
 - `glimmer_offset[]` / `glimmer_rate[]` / `frame_b[]` / `last_out[]` are sized at compile time from `LED_COUNT`. Bump `LED_COUNT` and they resize for free.
-- App partition is 1 MB; the prototype-03 binary uses **~94%** (vs. 87% on prototype-02.x). Adding more features will need either size optimization (`-Os` is already on) or a custom partition table.
+- App partition is 1 MB; the edition00 binary uses **~94%** (vs. 87% on prototype-02.x). Adding more features will need either size optimization (`-Os` is already on) or a custom partition table.
 - Debug portal creds (`DEBUG_USER` / `DEBUG_PASS`) and Wi-Fi creds are stored in NVS — they survive flash-app updates but are wiped by `idf.py erase-flash`.
 - Reset button bug-class: if you ever wire GPIO 9 (BOOT button) here by accident, you'll hold the chip in download mode. GPIO 20 is correct on this revision.
 
