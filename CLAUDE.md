@@ -1,18 +1,22 @@
 # phase-firmware
 
-ESP-IDF firmware for the Phase lamp — an ESP32-C3 driving a ring of WS2812 LEDs that renders the current moon phase, with a web UI for live tuning.
+ESP-IDF firmware for the Phase lamp — an ESP32-C3 driving a ring of addressable LEDs that renders the current moon phase, with a web UI for live tuning. Branch `prototype-03` ("edition00") is a substantial rework: SK6812 RGBW strip, captive-portal Wi-Fi provisioning, reset button, mDNS, and an auth-gated debug portal.
 
-## Hardware
+## Hardware (prototype-03.0)
 
-- **MCU:** ESP32-C3 (RISC-V, 2 MB flash)
-- **LEDs:** 90× WS2812 on GPIO 2, driven via RMT at 10 MHz (prototype-02.x used 52)
-- **Color:** warm white (R=255, G=120, B=40), brightness/floor/glimmer modulated per pixel
+- **MCU:** ESP32-C3 (RISC-V, single-core, 2 MB flash)
+- **LEDs:** 138× **SK6812 RGBW** on **GPIO 21**, GRBW byte order, driven via RMT at 10 MHz
+- LED 0 sits at **12 o'clock**; indices advance clockwise (`led_angle(i) = i * 360 / 138`)
+- **Color:** W channel only for moon rendering (R=G=B=0); B channel used for boot AP + Wi-Fi-connecting animations
+- **Reset button:** GPIO 20, active-low, internal pull-up. Hold 3 s to erase Wi-Fi creds and reboot
+- **UART caveat:** GPIO 21 = U0TXD, GPIO 20 = U0RXD — both pins are repurposed. RMT takes over GPIO 21 so LED data is fine; serial logs only show up on the secondary USB Serial/JTAG console (GPIO 18/19)
+
+Previous revisions: `prototype-02.x` = 52× WS2812 on GPIO 2; `prototype-04` = 90× WS2812 on GPIO 2.
 
 ## Project conventions
 
-- **CMake project name** is `phase-prototype` — stays constant across hardware revisions.
-- **Branch name** identifies the hardware revision (`prototype-02`, `prototype-02.1`, …). `FW_VERSION` in `main/phase-firmware.c` should match the branch.
-- Build output: `build/phase-prototype.bin`.
+- **CMake project name** is `phase-prototype` — stays constant across hardware revisions. Build artifact: `build/phase-prototype.bin`.
+- **Branch name** identifies the hardware revision (`prototype-02.1`, `prototype-03`, `prototype-04`, …). `FW_VERSION` in `main/phase-firmware.c` should match the branch.
 
 ## Build & flash
 
@@ -21,47 +25,76 @@ ESP-IDF lives at `~/esp/esp-idf`. Source it once per shell:
 ```bash
 source ~/esp/esp-idf/export.sh
 idf.py build
-idf.py -p /dev/cu.usbmodem101 flash monitor
+idf.py -p /dev/cu.usbmodem101 erase-flash       # only on first flash to a fresh chip
+idf.py -p /dev/cu.usbmodem101 flash             # writes bootloader + partition + app
 ```
 
 `idf.py fullclean` after switching branches or changing the cmake project name.
 
-## Code layout
+## Boot flow (prototype-03)
 
-Single-file app: `main/phase-firmware.c` (~715 lines). Sections inside:
+```
+                  ┌──────────────────────────────┐
+                  │   render_task starts in      │
+                  │   ANIM_BOOT (blue cycle)     │
+                  │   button_task starts polling │
+                  └──────────────┬───────────────┘
+                                 │
+              ┌──────────────────┴───────────────────┐
+              │ load_wifi_creds() from NVS namespace │
+              │              "phase"                 │
+              └──────────────┬───────────────────────┘
+              ↓ no                          ↓ yes
+   ┌─────────────────────┐      ┌────────────────────────┐
+   │ wifi_init_ap()      │      │ wifi_init_sta_with_    │
+   │  → SSID "phase"     │      │   creds(ssid, pass)    │
+   │ mdns + start_       │      │ wait EV_GOT_IP         │
+   │   webserver_ap()    │      │ ANIM_CONNECTING        │
+   │ park here forever   │      │ wait EV_CONNECTING_    │
+   │                     │      │   DONE (3 pulses)      │
+   │ /setup POST writes  │      │ mdns + start_          │
+   │ creds → esp_restart │      │   webserver_sta()      │
+   └─────────────────────┘      │ time_sync() (SNTP)     │
+                                │ ANIM_MOON              │
+                                └────────────────────────┘
+```
 
-- **NVS** — persists render params under namespace `phase`.
-- **Wi-Fi / SNTP** — STA mode, hardcoded creds (`WIFI_SSID` / `WIFI_PASSWORD`), NTP pool for moon-phase time base.
-- **Moon math** — `calc_moon_phase()` returns 0..1; `apply_curve()` shapes it via 4 control points (`q1, g1, g3, q3`) stored in NVS.
-- **Rendering** — `render_moon()` runs every 50 ms in `app_main`'s loop. Computes illumination per LED with a gradient edge, optional glimmer, and a brightness floor. Frame state cached in `last_frame[]`.
-- **Web server** — HTTP on port 80. Routes:
-  - `GET /` — single-page HTML UI (the big `HTML_PAGE` string literal).
-  - `GET /status` — JSON: phase, name, illumination, params.
-  - `GET /set?phase=…` — manual phase override (also `manual=0` to release).
-  - `GET /params?...` — live-update render params (non-persistent).
-  - `GET /params/save` — commit current params to NVS.
+## Code layout — `main/phase-firmware.c`
 
-## Dependencies
+Single file (~1100 lines). Sections:
 
-- `espressif/led_strip` (managed component, see `main/idf_component.yml`)
-- Plus core IDF: `esp_wifi`, `esp_http_server`, `esp_sntp`, `nvs_flash`.
+- **State / forward decls** — `s_anim_mode`, `s_events`, `led_mutex`, `s_strip`, `s_session_token`.
+- **NVS** — render params under key prefixes `face_gradient`/`brightness`/`curve_*`/…; Wi-Fi creds as `wifi_ssid`/`wifi_pass`. All NVS commits take `led_mutex`.
+- **Moon math** — `calc_moon_phase()`, `apply_curve()` (unchanged from prototype-02.x — kept per spec).
+- **Rendering** — split into `compute_moon_frame()` (writes `frame_b[]` brightness 0..1) and two output stages: `output_white()` (W channel) and `output_blue()` (B channel). Both delta-skip identical frames.
+- **render_task** — state machine over `ANIM_BOOT` / `ANIM_CONNECTING` / `ANIM_MOON`. Signals `EV_CONNECTING_DONE` after 3 pulses.
+- **button_task** — polls GPIO 20 every 50 ms, fires `clear_wifi_creds()` + `esp_restart()` after 3 s held.
+- **Wi-Fi** — `wifi_init_sta_with_creds()` (with `WIFI_PS_NONE`) or `wifi_init_ap()` (APSTA so we can scan from the AP).
+- **mDNS** — hostname `phase`, advertises `_http._tcp` on port 80.
+- **HTTP** — single `httpd_handle_t`, routes registered conditional on mode:
+  - **AP mode:** `/` (setup form), `/scan` (JSON of nearby networks), `POST /setup` (save creds → restart). `/debug` routes are also exposed for on-bench tuning.
+  - **STA + AP:** `/` (landing → /debug), `/debug` + `/debug/login` (cookie auth), `/debug/status`, `/debug/set`, `/debug/params`, `/debug/params/save`, `/debug/logout`.
+  - Auth: HTTP Basic-style POST → 32-char hex session token in RAM, set as `phase_sess` cookie. Regenerated on every boot.
+
+## Dependencies (`main/idf_component.yml`)
+
+- `espressif/led_strip` — SK6812 driver via RMT
+- `espressif/mdns` — mDNS responder
+- Core IDF: `esp_wifi`, `esp_http_server`, `esp_sntp`, `nvs_flash`, `driver/gpio`
 
 ## Notes / gotchas
 
-- Wi-Fi credentials are hardcoded in source — do not commit real creds for shipping units.
-- `glimmer_offset[]` / `glimmer_rate[]` are seeded once in `init_glimmer()` — reseed if you change `LED_COUNT`.
-- App partition is 1 MB; current binary is ~87% full. Watch size when adding features.
+- `glimmer_offset[]` / `glimmer_rate[]` / `frame_b[]` / `last_out[]` are sized at compile time from `LED_COUNT`. Bump `LED_COUNT` and they resize for free.
+- App partition is 1 MB; the prototype-03 binary uses **~94%** (vs. 87% on prototype-02.x). Adding more features will need either size optimization (`-Os` is already on) or a custom partition table.
+- Debug portal creds (`DEBUG_USER` / `DEBUG_PASS`) and Wi-Fi creds are stored in NVS — they survive flash-app updates but are wiped by `idf.py erase-flash`.
+- Reset button bug-class: if you ever wire GPIO 9 (BOOT button) here by accident, you'll hold the chip in download mode. GPIO 20 is correct on this revision.
 
-## WS2812 glitch fix (resolved, prototype-02.1)
+## WS2812/SK6812 glitch fix — carried forward from prototype-02.1
 
-Earlier prototype builds had random per-pixel flashes / wrong colors on the LED ring. This is the well-known **RMT-vs-Wi-Fi interrupt contention** failure mode on the single-core C3 — *not* a 3.3 V → 5 V level-shift problem. (Proof: WLED on the same hardware was clean.) The diode-drop-on-VDD trick is the wrong fix for this; it addresses VIH, not ISR timing.
+Random per-pixel flashes were caused by RMT-vs-Wi-Fi interrupt contention on the single-core C3 — *not* a 3.3 V → 5 V level-shift problem. Fixed in software via:
 
-What fixed it (all in software):
+1. `esp_wifi_set_ps(WIFI_PS_NONE)` after `esp_wifi_start()`.
+2. `led_strip_rmt_config_t.mem_block_symbols = 128`.
+3. Dedicated render task at `configMAX_PRIORITIES - 3` + `led_mutex` around `led_strip_refresh()` and any NVS commit.
 
-1. `esp_wifi_set_ps(WIFI_PS_NONE)` after `esp_wifi_start()` — disables Wi-Fi modem sleep so it doesn't preempt the RMT refill ISR.
-2. `led_strip_rmt_config_t.mem_block_symbols = 128` — doubles the RMT FIFO so the refill ISR has more slack.
-3. Dedicated render task at `configMAX_PRIORITIES - 3`, with a `led_mutex` guarding both `led_strip_refresh()` and `nvs_save_params()` so flash commits (which disable cache) can never overlap a frame in flight.
-
-References: [WLED #4382](https://github.com/wled/WLED/issues/4382), [Espressif led_strip docs](https://components.espressif.com/components/espressif/led_strip/). If glitches ever return on a new revision, look here first — re-check `mem_block_symbols`, Wi-Fi PS state, and that nothing new is calling NVS/SPIFFS without taking `led_mutex`.
-
-For a future hardware respin: add a 74AHCT125 buffer between GPIO 2 and DIN as belt-and-suspenders robustness (Adafruit-recommended). Skip the SB560-on-VDD trick.
+Refs: [WLED #4382](https://github.com/wled/WLED/issues/4382), [Espressif led_strip docs](https://components.espressif.com/components/espressif/led_strip/). If glitches return on a new revision: re-check `mem_block_symbols`, Wi-Fi PS state, and that nothing new calls NVS/SPIFFS without taking `led_mutex`. Hardware-level backup: 74AHCT125 buffer between data GPIO and DIN. Skip the SB560-on-VDD trick — wrong failure mode.

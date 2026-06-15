@@ -1,7 +1,38 @@
+// ════════════════════════════════════════════════════════════════════════
+//  Phase firmware — prototype-03.0 ("edition00")
+//
+//  Hardware:
+//    SK6812 RGBW × 138 on GPIO 21, reset button on GPIO 20.
+//    LED 0 sits at 12 o'clock; indices advance clockwise.
+//    Only the W channel is driven for normal moon rendering; the B channel
+//    is used for the boot-AP and Wi-Fi-connecting animations.
+//
+//  Boot:
+//    First boot (no saved creds) → open "phase" AP, slow blue moon-cycle
+//    animation, captive setup page at phase.local. After credentials are
+//    saved we restart into STA mode, play 3 slow blue pulses while we
+//    connect, then drop into the normal moon render.
+//
+//  Web:
+//    AP mode  : /  setup form, /scan JSON, /setup POST → save → restart.
+//    STA mode : / landing, /debug auth-protected control panel with the
+//               existing curve / brightness / face-gradient sliders plus
+//               phase scrubber, date picker, manual/real toggle.
+//
+//  Reset button: hold GPIO 20 (active-low, internal pull-up) for 3 s to
+//    erase Wi-Fi credentials and reboot to AP mode.
+//
+//  Note on UART: GPIO 21/20 are the default UART0 TX/RX pins. The RMT
+//    peripheral takes over GPIO 21 so it can drive the LED data line; UART
+//    output on that pin goes nowhere. Logs still flow through the secondary
+//    USB-Serial/JTAG console (GPIO 18/19).
+// ════════════════════════════════════════════════════════════════════════
+
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -9,30 +40,37 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_random.h"
+#include "esp_mac.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_sntp.h"
 #include "esp_http_server.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
+#include "driver/gpio.h"
+#include "mdns.h"
 #include "led_strip.h"
 
-// ── Your Wi-Fi credentials ─────────────────────────────────
-#define WIFI_SSID      "REDACTED_WIFI_SSID"
-#define WIFI_PASSWORD  "REDACTED_WIFI_PASSWORD"
+// ── Hardware ───────────────────────────────────────────────
+#define LED_GPIO         21
+#define BUTTON_GPIO      20
+#define LED_COUNT        138
+#define LED_RMT_RES_HZ   10000000
 
-// ── Hardware config ────────────────────────────────────────
-#define LED_GPIO        2
-#define LED_COUNT       90
-#define LED_RMT_RES_HZ  10000000
+// ── Identity ───────────────────────────────────────────────
+#define FW_VERSION       "prototype-03.0"
+#define AP_SSID          "phase"
+#define MDNS_HOSTNAME    "phase"
+#define MDNS_INSTANCE    "Lunar Objects — Phase"
 
-// ── LED color (warm white) ─────────────────────────────────
-#define WARM_R  255
-#define WARM_G  120
-#define WARM_B  40
+// ── Reset button ───────────────────────────────────────────
+#define BUTTON_HOLD_MS   3000
 
-// ── Firmware version ───────────────────────────────────────
-#define FW_VERSION  "prototype-04"
+// ── Debug portal credentials ───────────────────────────────
+#define DEBUG_USER       "REDACTED_DEBUG_USER"
+#define DEBUG_PASS       "REDACTED_DEBUG_PASS"
 
 // ── Rendering defaults ─────────────────────────────────────
 #define GRADIENT_WIDTH         0.28f
@@ -48,15 +86,56 @@
 #define DEFAULT_CURVE_G3       0.500f
 #define DEFAULT_CURVE_Q3       0.255f
 
-// ── Internal ───────────────────────────────────────────────
-#define TAG "phase"
-static EventGroupHandle_t wifi_events;
-#define WIFI_CONNECTED_BIT BIT0
+// ── Animation knobs ────────────────────────────────────────
+#define BOOT_ANIM_DIM          0.50f   // boot blue brightness cap
+#define BOOT_ANIM_PHASE_RATE   0.04f   // phase increments per render step (~25 s/cycle at 50 ms)
+#define CONNECTING_PULSE_DIM   0.65f   // peak brightness of the connecting pulse
+#define CONNECTING_PULSE_COUNT 3
 
-// Serialises led_strip_refresh() against any flash-touching code (NVS commit).
-// Flash ops disable the CPU cache, which can stall the RMT refill ISR and
-// corrupt the WS2812 frame mid-transmit.
+// ── Logging tag ────────────────────────────────────────────
+#define TAG "phase"
+
+// ──────────────────────────────────────────────────────────
+// Forward decls
+// ──────────────────────────────────────────────────────────
+static void nvs_save_params(void);
+static void nvs_load_params(void);
+static bool load_wifi_creds(char *ssid, size_t ssid_sz, char *pass, size_t pass_sz);
+static void save_wifi_creds(const char *ssid, const char *pass);
+static void clear_wifi_creds(void);
+static void mdns_setup(void);
+static void start_webserver_ap(void);
+static void start_webserver_sta(void);
+static float calc_moon_phase(void);
+static const char *phase_name(float phase);
+
+// ──────────────────────────────────────────────────────────
+// State
+// ──────────────────────────────────────────────────────────
+
+typedef enum {
+    ANIM_BOOT       = 0,   // slow blue moon-phase cycle (AP/provisioning)
+    ANIM_CONNECTING = 1,   // 3 blue pulses while connecting
+    ANIM_MOON       = 2,   // normal moon render
+} anim_mode_t;
+
+static volatile anim_mode_t s_anim_mode = ANIM_BOOT;
+
+static EventGroupHandle_t s_events;
+#define EV_GOT_IP            BIT0
+#define EV_CONNECTING_DONE   BIT1
+
+// Mutex serialising led_strip_refresh() against any flash-touching code
+// (NVS commit, scan, restart prep). Flash ops disable the CPU cache, which
+// can stall the RMT refill ISR and corrupt the SK6812 frame mid-transmit.
 static SemaphoreHandle_t led_mutex;
+
+// Strip handle, shared between render task and the (rare) blocking flushes
+// in main/handlers.
+static led_strip_handle_t s_strip;
+
+// Random session token for /debug cookies. 32 hex chars + null.
+static char s_session_token[33];
 
 // ── Live params ────────────────────────────────────────────
 static float p_face_gradient = DEFAULT_FACE_GRADIENT;
@@ -76,13 +155,11 @@ static bool  manual_mode  = false;
 static float manual_phase = 0.0f;
 
 // ──────────────────────────────────────────────────────────
-// NVS
+// NVS — render params
 // ──────────────────────────────────────────────────────────
 
 static void nvs_save_params(void)
 {
-    // Hold the LED mutex across the entire flash transaction. NVS commit
-    // disables cache, which would otherwise stall the RMT ISR mid-frame.
     xSemaphoreTake(led_mutex, portMAX_DELAY);
     nvs_handle_t h;
     if (nvs_open("phase", NVS_READWRITE, &h) != ESP_OK) {
@@ -103,7 +180,7 @@ static void nvs_save_params(void)
     nvs_commit(h);
     nvs_close(h);
     xSemaphoreGive(led_mutex);
-    ESP_LOGI(TAG, "Saved. q1=%.3f g1=%.3f g3=%.3f q3=%.3f",
+    ESP_LOGI(TAG, "Saved params. q1=%.3f g1=%.3f g3=%.3f q3=%.3f",
              p_curve_q1, p_curve_g1, p_curve_g3, p_curve_q3);
 }
 
@@ -124,71 +201,51 @@ static void nvs_load_params(void)
     if (nvs_get_i32(h, "curve_g3",      &v) == ESP_OK) p_curve_g3      = v / 1000.0f;
     if (nvs_get_i32(h, "curve_q3",      &v) == ESP_OK) p_curve_q3      = v / 1000.0f;
     nvs_close(h);
-    ESP_LOGI(TAG, "Loaded. q1=%.3f g1=%.3f g3=%.3f q3=%.3f",
+    ESP_LOGI(TAG, "Loaded params. q1=%.3f g1=%.3f g3=%.3f q3=%.3f",
              p_curve_q1, p_curve_g1, p_curve_g3, p_curve_q3);
 }
 
 // ──────────────────────────────────────────────────────────
-// Wi-Fi
+// NVS — Wi-Fi credentials
 // ──────────────────────────────────────────────────────────
 
-static void wifi_event_handler(void *arg, esp_event_base_t base,
-                                int32_t id, void *data)
+static bool load_wifi_creds(char *ssid, size_t ssid_sz, char *pass, size_t pass_sz)
 {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START)
-        esp_wifi_connect();
-    else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
-        esp_wifi_connect();
-    else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        xEventGroupSetBits(wifi_events, WIFI_CONNECTED_BIT);
-        esp_netif_ip_info_t ip_info;
-        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        esp_netif_get_ip_info(netif, &ip_info);
-        ESP_LOGI(TAG, "Open http://" IPSTR " in your browser", IP2STR(&ip_info.ip));
-    }
+    nvs_handle_t h;
+    if (nvs_open("phase", NVS_READONLY, &h) != ESP_OK) return false;
+    size_t s1 = ssid_sz, s2 = pass_sz;
+    esp_err_t e1 = nvs_get_str(h, "wifi_ssid", ssid, &s1);
+    esp_err_t e2 = nvs_get_str(h, "wifi_pass", pass, &s2);
+    nvs_close(h);
+    if (e1 != ESP_OK) { ssid[0] = '\0'; pass[0] = '\0'; return false; }
+    if (e2 != ESP_OK) { pass[0] = '\0'; }
+    return strlen(ssid) > 0;
 }
 
-static void wifi_init(void)
+static void save_wifi_creds(const char *ssid, const char *pass)
 {
-    wifi_events = xEventGroupCreate();
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
-    wifi_config_t wifi_cfg = {
-        .sta = { .ssid = WIFI_SSID, .password = WIFI_PASSWORD },
-    };
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
-    esp_wifi_start();
-    // Disable Wi-Fi modem sleep — on the single-core C3 it lets Wi-Fi ISRs
-    // preempt the RMT refill ISR long enough to corrupt WS2812 frames.
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    ESP_LOGI(TAG, "Connecting to Wi-Fi...");
-    xEventGroupWaitBits(wifi_events, WIFI_CONNECTED_BIT, false, true, portMAX_DELAY);
+    xSemaphoreTake(led_mutex, portMAX_DELAY);
+    nvs_handle_t h;
+    if (nvs_open("phase", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, "wifi_ssid", ssid ? ssid : "");
+        nvs_set_str(h, "wifi_pass", pass ? pass : "");
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    xSemaphoreGive(led_mutex);
 }
 
-// ──────────────────────────────────────────────────────────
-// Time sync
-// ──────────────────────────────────────────────────────────
-
-static void time_sync(void)
+static void clear_wifi_creds(void)
 {
-    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
-    esp_sntp_init();
-    ESP_LOGI(TAG, "Waiting for time sync...");
-    time_t now = 0;
-    struct tm timeinfo = {0};
-    while (timeinfo.tm_year < (2024 - 1900)) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        time(&now);
-        localtime_r(&now, &timeinfo);
+    xSemaphoreTake(led_mutex, portMAX_DELAY);
+    nvs_handle_t h;
+    if (nvs_open("phase", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_key(h, "wifi_ssid");
+        nvs_erase_key(h, "wifi_pass");
+        nvs_commit(h);
+        nvs_close(h);
     }
-    ESP_LOGI(TAG, "Time synced: %s", asctime(&timeinfo));
+    xSemaphoreGive(led_mutex);
 }
 
 // ──────────────────────────────────────────────────────────
@@ -225,7 +282,7 @@ static const char* phase_name(float phase)
     return "Waning Crescent";
 }
 
-// Custom illumination curve with 4 control points
+// Custom illumination curve with 4 control points.
 // New(0) → Q1 → Gibbous1 → Full(1) → Gibbous3 → Q3 → New(0)
 static float apply_curve(float phase)
 {
@@ -267,15 +324,19 @@ static float apply_curve(float phase)
 // LED rendering
 // ──────────────────────────────────────────────────────────
 
+// LED 0 sits at 12 o'clock; indices advance clockwise. Angle 0° = 12 o'clock.
+// (lit_center swings 90° → 270° for waxing → waning, matching N-hemisphere
+//  moon orientation when angle 90° = 3 o'clock side.)
 static float led_angle(int i)
 {
-    return fmodf((i + 1) * (360.0f / (float)LED_COUNT), 360.0f);
+    return fmodf((float)i * (360.0f / (float)LED_COUNT), 360.0f);
 }
 
 static float   glimmer_offset[LED_COUNT];
 static float   glimmer_rate[LED_COUNT];
-static uint8_t last_frame[LED_COUNT][3];
-static bool    last_frame_valid = false;
+static float   frame_b[LED_COUNT];       // brightness per pixel, 0..1
+static uint8_t last_out[LED_COUNT][4];   // last R,G,B,W actually sent
+static bool    last_out_valid = false;
 
 static void init_glimmer(void)
 {
@@ -294,11 +355,13 @@ static float glimmer_value(int led, float time_f, float edge_proximity)
     return 1.0f - amount * (0.5f + 0.5f * combined);
 }
 
-static void render_moon(led_strip_handle_t strip, float phase, float time_f)
+// Fill frame_b[] with brightness 0..1 for the given moon phase.
+// (Same math as legacy render_moon — separated from the output stage so the
+//  boot animation can recolor the same shape.)
+static void compute_moon_frame(float phase, float time_f)
 {
     float lit_arc = apply_curve(phase);
 
-    // Smooth the lit_center flip around full moon
     float lit_center;
     float flip_window = 0.04f;
     if (phase < 0.5f - flip_window) {
@@ -314,8 +377,6 @@ static void render_moon(led_strip_handle_t strip, float phase, float time_f)
     float gradient_deg = GRADIENT_WIDTH * 360.0f;
     float max_gradient = lit_arc * 0.25f;
     if (gradient_deg > max_gradient) gradient_deg = max_gradient;
-
-    uint8_t new_frame[LED_COUNT][3];
 
     for (int i = 0; i < LED_COUNT; i++) {
         float angle = led_angle(i);
@@ -347,79 +408,434 @@ static void render_moon(led_strip_handle_t strip, float phase, float time_f)
         brightness *= p_brightness;
         if (brightness < p_floor) brightness = 0.0f;
 
-        new_frame[i][0] = (uint8_t)(WARM_R * brightness);
-        new_frame[i][1] = (uint8_t)(WARM_G * brightness);
-        new_frame[i][2] = (uint8_t)(WARM_B * brightness);
+        if (brightness < 0.0f) brightness = 0.0f;
+        if (brightness > 1.0f) brightness = 1.0f;
+        frame_b[i] = brightness;
     }
+}
 
-    // Skip refresh if frame is identical to last — fewer transmissions,
-    // fewer chances for the data line to latch a corrupted byte.
-    bool changed = !last_frame_valid;
-    if (last_frame_valid) {
-        if (memcmp(new_frame, last_frame, sizeof(new_frame)) != 0) {
-            changed = true;
-        }
+// Drive the W channel from frame_b[] (R=G=B=0).
+static void output_white(void)
+{
+    uint8_t out[LED_COUNT][4];
+    for (int i = 0; i < LED_COUNT; i++) {
+        out[i][0] = 0;
+        out[i][1] = 0;
+        out[i][2] = 0;
+        out[i][3] = (uint8_t)(frame_b[i] * 255.0f);
     }
+    bool changed = !last_out_valid ||
+                   memcmp(out, last_out, sizeof(out)) != 0;
+    if (!changed) return;
 
-    if (changed) {
-        xSemaphoreTake(led_mutex, portMAX_DELAY);
-        for (int i = 0; i < LED_COUNT; i++) {
-            led_strip_set_pixel(strip, i,
-                new_frame[i][0], new_frame[i][1], new_frame[i][2]);
+    xSemaphoreTake(led_mutex, portMAX_DELAY);
+    for (int i = 0; i < LED_COUNT; i++) {
+        led_strip_set_pixel_rgbw(s_strip, i,
+            out[i][0], out[i][1], out[i][2], out[i][3]);
+    }
+    led_strip_refresh(s_strip);
+    xSemaphoreGive(led_mutex);
+    memcpy(last_out, out, sizeof(out));
+    last_out_valid = true;
+}
+
+// Drive only the B channel from frame_b[] (R=G=W=0). Used for boot AP +
+// "connecting" animations.
+static void output_blue(void)
+{
+    uint8_t out[LED_COUNT][4];
+    for (int i = 0; i < LED_COUNT; i++) {
+        out[i][0] = 0;
+        out[i][1] = 0;
+        out[i][2] = (uint8_t)(frame_b[i] * 255.0f);
+        out[i][3] = 0;
+    }
+    bool changed = !last_out_valid ||
+                   memcmp(out, last_out, sizeof(out)) != 0;
+    if (!changed) return;
+
+    xSemaphoreTake(led_mutex, portMAX_DELAY);
+    for (int i = 0; i < LED_COUNT; i++) {
+        led_strip_set_pixel_rgbw(s_strip, i,
+            out[i][0], out[i][1], out[i][2], out[i][3]);
+    }
+    led_strip_refresh(s_strip);
+    xSemaphoreGive(led_mutex);
+    memcpy(last_out, out, sizeof(out));
+    last_out_valid = true;
+}
+
+// ──────────────────────────────────────────────────────────
+// Render task
+// ──────────────────────────────────────────────────────────
+
+static void render_task(void *arg)
+{
+    (void)arg;
+    float time_f      = 0.0f;
+    float boot_phase  = 0.0f;
+    float pulse_t     = 0.0f;
+    int   pulse_count = 0;
+    anim_mode_t prev_mode = (anim_mode_t)-1;
+
+    while (1) {
+        anim_mode_t mode = s_anim_mode;
+        if (mode != prev_mode) {
+            // Force a redraw on mode change since the frame buffer hasn't
+            // necessarily changed.
+            last_out_valid = false;
+            pulse_t = 0.0f;
+            pulse_count = 0;
+            prev_mode = mode;
         }
-        led_strip_refresh(strip);
-        xSemaphoreGive(led_mutex);
-        memcpy(last_frame, new_frame, sizeof(new_frame));
-        last_frame_valid = true;
+
+        switch (mode) {
+        case ANIM_BOOT: {
+            compute_moon_frame(boot_phase, time_f);
+            for (int i = 0; i < LED_COUNT; i++) frame_b[i] *= BOOT_ANIM_DIM;
+            output_blue();
+            boot_phase = fmodf(boot_phase + BOOT_ANIM_PHASE_RATE * 0.05f, 1.0f);
+            break;
+        }
+        case ANIM_CONNECTING: {
+            // 1 Hz pulse, peak at CONNECTING_PULSE_DIM, stop after N pulses.
+            float bright = CONNECTING_PULSE_DIM *
+                           (0.5f - 0.5f * cosf(pulse_t * 2.0f * (float)M_PI));
+            for (int i = 0; i < LED_COUNT; i++) frame_b[i] = bright;
+            output_blue();
+            pulse_t += 0.05f;
+            if (pulse_t >= 1.0f) {
+                pulse_t = 0.0f;
+                pulse_count++;
+                if (pulse_count >= CONNECTING_PULSE_COUNT) {
+                    xEventGroupSetBits(s_events, EV_CONNECTING_DONE);
+                }
+            }
+            break;
+        }
+        case ANIM_MOON:
+        default: {
+            float phase = manual_mode ? manual_phase : calc_moon_phase();
+            compute_moon_frame(phase, time_f);
+            output_white();
+            break;
+        }
+        }
+
+        time_f += (p_glimmer_speed * 0.001f) * 50.0f;
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 // ──────────────────────────────────────────────────────────
-// Web portal
+// Reset button — hold 3 s to forget Wi-Fi
 // ──────────────────────────────────────────────────────────
 
-static const char *HTML_PAGE =
+static void button_task(void *arg)
+{
+    (void)arg;
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << BUTTON_GPIO,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+
+    int held_ms = 0;
+    while (1) {
+        if (gpio_get_level(BUTTON_GPIO) == 0) {  // active low
+            held_ms += 50;
+            if (held_ms == 1000 || held_ms == 2000) {
+                ESP_LOGI(TAG, "Reset button held %dms…", held_ms);
+            }
+            if (held_ms >= BUTTON_HOLD_MS) {
+                ESP_LOGW(TAG, "Reset button held %dms — clearing Wi-Fi creds and rebooting",
+                         BUTTON_HOLD_MS);
+                clear_wifi_creds();
+                vTaskDelay(pdMS_TO_TICKS(100));
+                esp_restart();
+            }
+        } else {
+            held_ms = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// ──────────────────────────────────────────────────────────
+// mDNS
+// ──────────────────────────────────────────────────────────
+
+static void mdns_setup(void)
+{
+    esp_err_t err = mdns_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mdns_init failed: %s", esp_err_to_name(err));
+        return;
+    }
+    mdns_hostname_set(MDNS_HOSTNAME);
+    mdns_instance_name_set(MDNS_INSTANCE);
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    ESP_LOGI(TAG, "mDNS up — http://%s.local/", MDNS_HOSTNAME);
+}
+
+// ──────────────────────────────────────────────────────────
+// Wi-Fi event handling
+// ──────────────────────────────────────────────────────────
+
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                                int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupSetBits(s_events, EV_GOT_IP);
+        esp_netif_ip_info_t ip_info;
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK)
+            ESP_LOGI(TAG, "Got IP " IPSTR, IP2STR(&ip_info.ip));
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
+        ESP_LOGI(TAG, "Client joined the phase AP");
+    }
+}
+
+static void wifi_init_sta_with_creds(const char *ssid, const char *pass)
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
+
+    wifi_config_t wifi_cfg = {0};
+    strncpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid) - 1);
+    strncpy((char *)wifi_cfg.sta.password, pass, sizeof(wifi_cfg.sta.password) - 1);
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
+    esp_wifi_start();
+    // Critical for SK6812-on-C3 — see prototype-02.1 commit a13ae3e.
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_LOGI(TAG, "STA mode — connecting to \"%s\"…", ssid);
+}
+
+// AP + STA so we can scan while the AP is up for the setup page.
+static void wifi_init_ap(void)
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_ap();
+    esp_netif_create_default_wifi_sta();   // scan-only, never connects
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
+
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .ssid           = AP_SSID,
+            .ssid_len       = (uint8_t)strlen(AP_SSID),
+            .channel        = 6,
+            .authmode       = WIFI_AUTH_OPEN,
+            .max_connection = 4,
+        },
+    };
+
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
+    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    esp_wifi_start();
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_LOGI(TAG, "AP mode — SSID \"%s\" (open) — http://%s.local/", AP_SSID, MDNS_HOSTNAME);
+}
+
+// ──────────────────────────────────────────────────────────
+// Time sync
+// ──────────────────────────────────────────────────────────
+
+static void time_sync(void)
+{
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    ESP_LOGI(TAG, "Waiting for SNTP…");
+    time_t now = 0;
+    struct tm timeinfo = {0};
+    while (timeinfo.tm_year < (2024 - 1900)) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        time(&now);
+        localtime_r(&now, &timeinfo);
+    }
+    ESP_LOGI(TAG, "Time synced: %s", asctime(&timeinfo));
+}
+
+// ──────────────────────────────────────────────────────────
+// HTTP — session auth helpers
+// ──────────────────────────────────────────────────────────
+
+static void make_session_token(void)
+{
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        s_session_token[i] = hex[esp_random() & 0xF];
+    }
+    s_session_token[32] = '\0';
+}
+
+static bool req_is_authed(httpd_req_t *req)
+{
+    size_t need = httpd_req_get_hdr_value_len(req, "Cookie") + 1;
+    if (need <= 1) return false;
+    char *cookie = malloc(need);
+    if (!cookie) return false;
+    if (httpd_req_get_hdr_value_str(req, "Cookie", cookie, need) != ESP_OK) {
+        free(cookie);
+        return false;
+    }
+    char *p = strstr(cookie, "phase_sess=");
+    bool ok = false;
+    if (p) {
+        p += strlen("phase_sess=");
+        ok = (strncmp(p, s_session_token, 32) == 0);
+    }
+    free(cookie);
+    return ok;
+}
+
+// Send redirect, optionally with Set-Cookie.
+static esp_err_t send_redirect(httpd_req_t *req, const char *location, const char *cookie_or_null)
+{
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", location);
+    if (cookie_or_null) httpd_resp_set_hdr(req, "Set-Cookie", cookie_or_null);
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+// ──────────────────────────────────────────────────────────
+// HTTP — pages (HTML)
+// ──────────────────────────────────────────────────────────
+
+// Shared style block — used by both the AP setup page and the debug UI.
+#define PHASE_STYLE \
+"*{box-sizing:border-box;margin:0;padding:0}" \
+"body{background:#0a0a0a;color:#e8e0d0;font-family:'Courier New',monospace;" \
+"display:flex;justify-content:center;min-height:100vh;padding:20px}" \
+".card{background:#111;border:1px solid #2a2a2a;border-radius:4px;" \
+"padding:32px;width:100%;max-width:420px;align-self:flex-start;margin-top:40px}" \
+"h1{font-size:11px;letter-spacing:.35em;text-transform:uppercase;color:#555;margin-bottom:32px}" \
+".phase-display{text-align:center;margin-bottom:36px}" \
+".phase-name{font-size:24px;color:#e8e0d0;margin-bottom:8px;font-weight:normal}" \
+".phase-pct{font-size:12px;color:#555;letter-spacing:.2em}" \
+".mode-row{display:flex;gap:10px;margin-bottom:32px}" \
+".mode-btn{flex:1;padding:11px;border:1px solid #333;background:transparent;" \
+"color:#555;font-family:inherit;font-size:11px;letter-spacing:.2em;" \
+"text-transform:uppercase;cursor:pointer;border-radius:2px;transition:all .2s}" \
+".mode-btn.active{border-color:#e8e0d0;color:#e8e0d0}" \
+".controls{transition:opacity .3s}" \
+".controls.dim{opacity:.25;pointer-events:none}" \
+"label{display:flex;justify-content:space-between;font-size:10px;letter-spacing:.2em;" \
+"color:#555;text-transform:uppercase;margin-bottom:8px}" \
+"label span{color:#e8e0d0;letter-spacing:0}" \
+"input[type=range]{width:100%;accent-color:#e8e0d0;cursor:pointer;margin-bottom:20px}" \
+"input[type=date],input[type=text],input[type=password],select{width:100%;background:#1a1a1a;" \
+"border:1px solid #2a2a2a;color:#e8e0d0;font-family:inherit;font-size:13px;padding:11px;" \
+"border-radius:2px;margin-bottom:20px;color-scheme:dark}" \
+".slider-labels{display:flex;justify-content:space-between;" \
+"font-size:10px;color:#444;margin-top:-16px;margin-bottom:20px}" \
+"hr{border:none;border-top:1px solid #1e1e1e;margin:24px 0}" \
+".section-title{font-size:10px;letter-spacing:.3em;text-transform:uppercase;" \
+"color:#444;margin-bottom:20px}" \
+".note{font-size:10px;color:#444;margin-top:-14px;margin-bottom:20px;line-height:1.6}" \
+".save-btn,.primary-btn{width:100%;padding:13px;border:1px solid #e8e0d0;background:transparent;" \
+"color:#e8e0d0;font-family:inherit;font-size:11px;letter-spacing:.25em;" \
+"text-transform:uppercase;cursor:pointer;border-radius:2px;margin-top:4px;transition:all .2s}" \
+".save-btn:hover,.primary-btn:hover{background:#e8e0d0;color:#0a0a0a}" \
+".status{font-size:10px;color:#333;text-align:center;letter-spacing:.1em;margin-top:16px}" \
+".saved-msg{color:#888;font-size:10px;text-align:center;margin-top:12px;" \
+"letter-spacing:.15em;opacity:0;transition:opacity .5s}" \
+".err{color:#c66;font-size:11px;text-align:center;margin-top:8px}"
+
+// ───── AP setup page ─────
+static const char *SETUP_PAGE =
+"<!DOCTYPE html><html><head>"
+"<meta name='viewport' content='width=device-width, initial-scale=1'>"
+"<title>Phase — Setup</title>"
+"<style>" PHASE_STYLE "</style></head><body><div class='card'>"
+"<h1>Lunar Objects &mdash; Phase Setup</h1>"
+"<div class='phase-display'>"
+"<div class='phase-name'>Hello.</div>"
+"<div class='phase-pct'>Pick your Wi-Fi network</div>"
+"</div>"
+"<form method='POST' action='/setup'>"
+"<label>Network<span></span></label>"
+"<select name='ssid' id='ssid'><option value=''>scanning…</option></select>"
+"<label>Password<span></span></label>"
+"<input type='password' name='pass' autocomplete='off'/>"
+"<button class='primary-btn' type='submit'>Connect</button>"
+"</form>"
+"<div class='status'>firmware " FW_VERSION "</div>"
+"</div>"
+"<script>"
+"fetch('/scan').then(function(r){return r.json();}).then(function(j){"
+"var s=document.getElementById('ssid');s.innerHTML='';"
+"if(!j.networks||!j.networks.length){var o=document.createElement('option');"
+"o.value='';o.textContent='no networks found';s.appendChild(o);return;}"
+"j.networks.forEach(function(n){var o=document.createElement('option');"
+"o.value=n.ssid;o.textContent=n.ssid+'  ('+n.rssi+' dBm'+(n.locked?' \\uD83D\\uDD12':'')+')';"
+"s.appendChild(o);});}).catch(function(){"
+"var s=document.getElementById('ssid');s.innerHTML="
+"'<option value=\"\">scan failed — type SSID manually</option>'"
+"+'<option value=\"__manual__\">(enter manually)</option>';});"
+"</script>"
+"</body></html>";
+
+// ───── STA mode landing ─────
+static const char *LANDING_PAGE =
+"<!DOCTYPE html><html><head>"
+"<meta name='viewport' content='width=device-width, initial-scale=1'>"
+"<meta http-equiv='refresh' content='0;url=/debug'>"
+"<title>Phase</title>"
+"<style>" PHASE_STYLE "</style></head><body><div class='card'>"
+"<h1>Lunar Objects &mdash; Phase</h1>"
+"<div class='phase-display'>"
+"<div class='phase-name'>online.</div>"
+"<div class='phase-pct'>→ /debug</div>"
+"</div></div></body></html>";
+
+// ───── Debug login page ─────
+static const char *LOGIN_PAGE =
+"<!DOCTYPE html><html><head>"
+"<meta name='viewport' content='width=device-width, initial-scale=1'>"
+"<title>Phase — Debug</title>"
+"<style>" PHASE_STYLE "</style></head><body><div class='card'>"
+"<h1>Lunar Objects &mdash; Debug</h1>"
+"<div class='phase-display'>"
+"<div class='phase-name'>Locked.</div>"
+"<div class='phase-pct'>authenticate to continue</div>"
+"</div>"
+"<form method='POST' action='/debug/login'>"
+"<label>Username<span></span></label>"
+"<input type='text' name='user' autocomplete='username'/>"
+"<label>Password<span></span></label>"
+"<input type='password' name='pass' autocomplete='current-password'/>"
+"<button class='primary-btn' type='submit'>Sign In</button>"
+"</form>"
+"<div class='status'>firmware " FW_VERSION "</div>"
+"</div></body></html>";
+
+// ───── Debug main UI ─────
+static const char *DEBUG_PAGE =
 "<!DOCTYPE html><html><head>"
 "<meta name='viewport' content='width=device-width, initial-scale=1'>"
 "<title>Phase</title>"
-"<style>"
-"*{box-sizing:border-box;margin:0;padding:0}"
-"body{background:#0a0a0a;color:#e8e0d0;font-family:'Courier New',monospace;"
-"display:flex;justify-content:center;min-height:100vh;padding:20px}"
-".card{background:#111;border:1px solid #2a2a2a;border-radius:4px;"
-"padding:32px;width:100%;max-width:420px;align-self:flex-start;margin-top:40px}"
-"h1{font-size:11px;letter-spacing:.35em;text-transform:uppercase;color:#555;margin-bottom:32px}"
-".phase-display{text-align:center;margin-bottom:36px}"
-".phase-name{font-size:24px;color:#e8e0d0;margin-bottom:8px;font-weight:normal}"
-".phase-pct{font-size:12px;color:#555;letter-spacing:.2em}"
-".mode-row{display:flex;gap:10px;margin-bottom:32px}"
-".mode-btn{flex:1;padding:11px;border:1px solid #333;background:transparent;"
-"color:#555;font-family:inherit;font-size:11px;letter-spacing:.2em;"
-"text-transform:uppercase;cursor:pointer;border-radius:2px;transition:all .2s}"
-".mode-btn.active{border-color:#e8e0d0;color:#e8e0d0}"
-".controls{transition:opacity .3s}"
-".controls.dim{opacity:.25;pointer-events:none}"
-"label{display:flex;justify-content:space-between;font-size:10px;letter-spacing:.2em;"
-"color:#555;text-transform:uppercase;margin-bottom:8px}"
-"label span{color:#e8e0d0;letter-spacing:0}"
-"input[type=range]{width:100%;accent-color:#e8e0d0;cursor:pointer;margin-bottom:20px}"
-"input[type=date]{width:100%;background:#1a1a1a;border:1px solid #2a2a2a;"
-"color:#e8e0d0;font-family:inherit;font-size:13px;padding:11px;"
-"border-radius:2px;margin-bottom:20px;color-scheme:dark}"
-".slider-labels{display:flex;justify-content:space-between;"
-"font-size:10px;color:#444;margin-top:-16px;margin-bottom:20px}"
-"hr{border:none;border-top:1px solid #1e1e1e;margin:24px 0}"
-".section-title{font-size:10px;letter-spacing:.3em;text-transform:uppercase;"
-"color:#444;margin-bottom:20px}"
-".note{font-size:10px;color:#444;margin-top:-14px;margin-bottom:20px;line-height:1.6}"
-".save-btn{width:100%;padding:13px;border:1px solid #e8e0d0;background:transparent;"
-"color:#e8e0d0;font-family:inherit;font-size:11px;letter-spacing:.25em;"
-"text-transform:uppercase;cursor:pointer;border-radius:2px;margin-top:4px;transition:all .2s}"
-".save-btn:hover{background:#e8e0d0;color:#0a0a0a}"
-".status{font-size:10px;color:#333;text-align:center;letter-spacing:.1em;margin-top:16px}"
-".saved-msg{color:#888;font-size:10px;text-align:center;margin-top:12px;"
-"letter-spacing:.15em;opacity:0;transition:opacity .5s}"
-"</style></head><body><div class='card'>"
+"<style>" PHASE_STYLE "</style></head><body><div class='card'>"
 "<h1>Lunar Objects &mdash; Phase</h1>"
 "<div class='phase-display'>"
 "<div class='phase-name' id='pname'>—</div>"
@@ -517,7 +933,7 @@ static const char *HTML_PAGE =
 "document.getElementById('slider').value=Math.round(p*1000);"
 "updateDisplay(p);sendPhase(p);}"
 "function sendPhase(p){"
-"var url=p<0?'/set?mode=real':'/set?mode=manual&phase='+p.toFixed(4);"
+"var url=p<0?'/debug/set?mode=real':'/debug/set?mode=manual&phase='+p.toFixed(4);"
 "fetch(url).catch(function(){});}"
 "function onParam(){"
 "var q1=document.getElementById('s-q1').value/1000.0;"
@@ -540,7 +956,7 @@ static const char *HTML_PAGE =
 "document.getElementById('lbl-gbase').textContent=gbase.toFixed(3);"
 "document.getElementById('lbl-gedge').textContent=gedge.toFixed(3);"
 "document.getElementById('lbl-gspeed').textContent=gspeed.toFixed(3);"
-"fetch('/params?q1='+q1.toFixed(3)+'&g1='+g1.toFixed(3)"
+"fetch('/debug/params?q1='+q1.toFixed(3)+'&g1='+g1.toFixed(3)"
 "+'&g3='+g3.toFixed(3)+'&q3='+q3.toFixed(3)"
 "+'&bright='+bright.toFixed(3)+'&grad='+grad.toFixed(3)"
 "+'&floor='+floor.toFixed(3)"
@@ -549,15 +965,15 @@ static const char *HTML_PAGE =
 "function setGlimmer(on){"
 "document.getElementById('btn-gon-off').classList.toggle('active',!on);"
 "document.getElementById('btn-gon-on').classList.toggle('active',on);"
-"fetch('/params?gon='+(on?'1':'0')).catch(function(){});}"
+"fetch('/debug/params?gon='+(on?'1':'0')).catch(function(){});}"
 "function saveParams(){"
-"fetch('/params/save').then(function(){"
+"fetch('/debug/params/save').then(function(){"
 "var m=document.getElementById('saved-msg');"
 "m.style.opacity=1;"
 "setTimeout(function(){m.style.opacity=0;},2000);"
 "}).catch(function(){});}"
 "function poll(){"
-"fetch('/status').then(function(r){return r.json();})"
+"fetch('/debug/status').then(function(r){return r.json();})"
 ".then(function(d){"
 "if(!isManual){updateDisplay(d.phase);document.getElementById('slider').value=Math.round(d.phase*1000);}"
 "document.getElementById('status').textContent='http://'+d.ip;"
@@ -587,15 +1003,248 @@ static const char *HTML_PAGE =
 "poll();setInterval(poll,5000);"
 "</script></body></html>";
 
-static esp_err_t handle_root(httpd_req_t *req)
+// ──────────────────────────────────────────────────────────
+// HTTP — helpers for parsing form bodies
+// ──────────────────────────────────────────────────────────
+
+static int url_decode_into(char *dst, size_t dst_sz, const char *src, size_t src_len)
+{
+    size_t o = 0;
+    for (size_t i = 0; i < src_len && o + 1 < dst_sz; i++) {
+        char c = src[i];
+        if (c == '+') {
+            dst[o++] = ' ';
+        } else if (c == '%' && i + 2 < src_len) {
+            char hex[3] = {src[i+1], src[i+2], 0};
+            dst[o++] = (char)strtol(hex, NULL, 16);
+            i += 2;
+        } else {
+            dst[o++] = c;
+        }
+    }
+    dst[o] = '\0';
+    return (int)o;
+}
+
+static bool form_get(const char *body, const char *key, char *out, size_t out_sz)
+{
+    size_t klen = strlen(key);
+    const char *p = body;
+    while (*p) {
+        if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            const char *v = p + klen + 1;
+            const char *end = strchr(v, '&');
+            size_t vlen = end ? (size_t)(end - v) : strlen(v);
+            url_decode_into(out, out_sz, v, vlen);
+            return true;
+        }
+        const char *next = strchr(p, '&');
+        if (!next) break;
+        p = next + 1;
+    }
+    out[0] = '\0';
+    return false;
+}
+
+// Drain a POST body (small forms only). Caller owns buffer.
+static int read_post_body(httpd_req_t *req, char *buf, size_t buf_sz)
+{
+    int remaining = req->content_len;
+    int total     = 0;
+    while (remaining > 0 && total + 1 < (int)buf_sz) {
+        int chunk = httpd_req_recv(req, buf + total,
+                                   remaining < (int)(buf_sz - 1 - total)
+                                       ? remaining : (int)(buf_sz - 1 - total));
+        if (chunk <= 0) break;
+        total     += chunk;
+        remaining -= chunk;
+    }
+    buf[total] = '\0';
+    return total;
+}
+
+// ──────────────────────────────────────────────────────────
+// HTTP — handlers (AP mode)
+// ──────────────────────────────────────────────────────────
+
+static esp_err_t handle_setup_root(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, HTML_PAGE, strlen(HTML_PAGE));
+    httpd_resp_send(req, SETUP_PAGE, strlen(SETUP_PAGE));
+    return ESP_OK;
+}
+
+static esp_err_t handle_scan(httpd_req_t *req)
+{
+    wifi_scan_config_t scan = {0};
+    esp_wifi_scan_start(&scan, true);
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if (n > 24) n = 24;
+    wifi_ap_record_t *aps = calloc(n, sizeof(wifi_ap_record_t));
+    if (!aps) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"networks\":[]}", 15);
+        return ESP_OK;
+    }
+    esp_wifi_scan_get_ap_records(&n, aps);
+
+    char *out = malloc(4096);
+    if (!out) { free(aps); return ESP_FAIL; }
+    int len = snprintf(out, 4096, "{\"networks\":[");
+    for (int i = 0; i < n; i++) {
+        char ssid_esc[64] = {0};
+        // Naive JSON escape — SSIDs rarely contain quotes/backslashes.
+        const char *s = (const char *)aps[i].ssid;
+        if (!s[0]) continue;
+        int j = 0;
+        for (int k = 0; s[k] && j < (int)sizeof(ssid_esc) - 2; k++) {
+            char c = s[k];
+            if (c == '"' || c == '\\') ssid_esc[j++] = '\\';
+            ssid_esc[j++] = c;
+        }
+        ssid_esc[j] = '\0';
+        len += snprintf(out + len, 4096 - len,
+            "%s{\"ssid\":\"%s\",\"rssi\":%d,\"locked\":%s}",
+            (i == 0 ? "" : ","),
+            ssid_esc, aps[i].rssi,
+            aps[i].authmode == WIFI_AUTH_OPEN ? "false" : "true");
+        if (len > 3900) break;
+    }
+    len += snprintf(out + len, 4096 - len, "]}");
+    free(aps);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, out, len);
+    free(out);
+    return ESP_OK;
+}
+
+static esp_err_t handle_setup_post(httpd_req_t *req)
+{
+    char body[512];
+    int n = read_post_body(req, body, sizeof(body));
+    if (n <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "no body", 7);
+        return ESP_OK;
+    }
+    char ssid[64] = {0};
+    char pass[64] = {0};
+    if (!form_get(body, "ssid", ssid, sizeof(ssid)) || strlen(ssid) == 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "missing ssid", 12);
+        return ESP_OK;
+    }
+    form_get(body, "pass", pass, sizeof(pass));
+
+    save_wifi_creds(ssid, pass);
+    ESP_LOGI(TAG, "Saved creds for \"%s\" — rebooting…", ssid);
+
+    const char *ok_html =
+        "<!DOCTYPE html><html><head><meta name='viewport' "
+        "content='width=device-width, initial-scale=1'>"
+        "<style>" PHASE_STYLE "</style></head><body><div class='card'>"
+        "<h1>Lunar Objects &mdash; Phase</h1>"
+        "<div class='phase-display'>"
+        "<div class='phase-name'>Saved.</div>"
+        "<div class='phase-pct'>connecting…</div>"
+        "</div></div></body></html>";
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, ok_html, strlen(ok_html));
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
+// ──────────────────────────────────────────────────────────
+// HTTP — handlers (STA mode + debug portal)
+// ──────────────────────────────────────────────────────────
+
+static esp_err_t handle_landing(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, LANDING_PAGE, strlen(LANDING_PAGE));
+    return ESP_OK;
+}
+
+static esp_err_t handle_login_get(httpd_req_t *req)
+{
+    if (req_is_authed(req)) {
+        return send_redirect(req, "/debug", NULL);
+    }
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, LOGIN_PAGE, strlen(LOGIN_PAGE));
+    return ESP_OK;
+}
+
+static esp_err_t handle_login_post(httpd_req_t *req)
+{
+    char body[256];
+    int n = read_post_body(req, body, sizeof(body));
+    if (n <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "no body", 7);
+        return ESP_OK;
+    }
+    char user[64] = {0};
+    char pass[64] = {0};
+    form_get(body, "user", user, sizeof(user));
+    form_get(body, "pass", pass, sizeof(pass));
+
+    if (strcmp(user, DEBUG_USER) == 0 && strcmp(pass, DEBUG_PASS) == 0) {
+        char cookie[96];
+        snprintf(cookie, sizeof(cookie),
+            "phase_sess=%s; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax",
+            s_session_token);
+        return send_redirect(req, "/debug", cookie);
+    }
+    // Wrong creds → re-render the login page with an error banner.
+    const char *fail =
+        "<!DOCTYPE html><html><head><meta name='viewport' "
+        "content='width=device-width, initial-scale=1'>"
+        "<style>" PHASE_STYLE "</style></head><body><div class='card'>"
+        "<h1>Lunar Objects &mdash; Debug</h1>"
+        "<div class='phase-display'>"
+        "<div class='phase-name'>Denied.</div>"
+        "<div class='phase-pct'>incorrect credentials</div>"
+        "</div>"
+        "<form method='POST' action='/debug/login'>"
+        "<label>Username<span></span></label>"
+        "<input type='text' name='user' autocomplete='username'/>"
+        "<label>Password<span></span></label>"
+        "<input type='password' name='pass' autocomplete='current-password'/>"
+        "<button class='primary-btn' type='submit'>Sign In</button>"
+        "</form>"
+        "<div class='err'>Wrong username or password.</div>"
+        "</div></body></html>";
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, fail, strlen(fail));
+    return ESP_OK;
+}
+
+static esp_err_t handle_logout(httpd_req_t *req)
+{
+    return send_redirect(req, "/debug/login",
+        "phase_sess=; Path=/; Max-Age=0");
+}
+
+static esp_err_t handle_debug_root(httpd_req_t *req)
+{
+    if (!req_is_authed(req)) {
+        return send_redirect(req, "/debug/login", NULL);
+    }
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, DEBUG_PAGE, strlen(DEBUG_PAGE));
     return ESP_OK;
 }
 
 static esp_err_t handle_status(httpd_req_t *req)
 {
+    if (!req_is_authed(req)) {
+        return send_redirect(req, "/debug/login", NULL);
+    }
     float phase = manual_mode ? manual_phase : calc_moon_phase();
     float ill   = phase_to_illumination(phase);
     char ip_str[16] = "unknown";
@@ -625,6 +1274,9 @@ static esp_err_t handle_status(httpd_req_t *req)
 
 static esp_err_t handle_set(httpd_req_t *req)
 {
+    if (!req_is_authed(req)) {
+        return send_redirect(req, "/debug/login", NULL);
+    }
     char query[128] = {0};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
         httpd_resp_send(req, "bad request", 11); return ESP_OK;
@@ -647,6 +1299,9 @@ static esp_err_t handle_set(httpd_req_t *req)
 
 static esp_err_t handle_params(httpd_req_t *req)
 {
+    if (!req_is_authed(req)) {
+        return send_redirect(req, "/debug/login", NULL);
+    }
     char query[256] = {0};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         char val[16];
@@ -668,82 +1323,146 @@ static esp_err_t handle_params(httpd_req_t *req)
 
 static esp_err_t handle_params_save(httpd_req_t *req)
 {
+    if (!req_is_authed(req)) {
+        return send_redirect(req, "/debug/login", NULL);
+    }
     nvs_save_params();
     httpd_resp_send(req, "ok", 2);
     return ESP_OK;
 }
 
-static void start_webserver(void)
+// ──────────────────────────────────────────────────────────
+// HTTP — server bring-up
+// ──────────────────────────────────────────────────────────
+
+static void register_debug_routes(httpd_handle_t server)
+{
+    httpd_uri_t routes[] = {
+        { .uri="/",                 .method=HTTP_GET,  .handler=handle_landing      },
+        { .uri="/debug",            .method=HTTP_GET,  .handler=handle_debug_root   },
+        { .uri="/debug/login",      .method=HTTP_GET,  .handler=handle_login_get    },
+        { .uri="/debug/login",      .method=HTTP_POST, .handler=handle_login_post   },
+        { .uri="/debug/logout",     .method=HTTP_GET,  .handler=handle_logout       },
+        { .uri="/debug/status",     .method=HTTP_GET,  .handler=handle_status       },
+        { .uri="/debug/set",        .method=HTTP_GET,  .handler=handle_set          },
+        { .uri="/debug/params",     .method=HTTP_GET,  .handler=handle_params       },
+        { .uri="/debug/params/save",.method=HTTP_GET,  .handler=handle_params_save  },
+    };
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++)
+        httpd_register_uri_handler(server, &routes[i]);
+}
+
+static void start_webserver_sta(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 16;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start web server"); return;
+        ESP_LOGE(TAG, "Failed to start STA web server");
+        return;
     }
-    httpd_uri_t routes[] = {
-        { .uri="/",            .method=HTTP_GET, .handler=handle_root        },
-        { .uri="/status",      .method=HTTP_GET, .handler=handle_status      },
-        { .uri="/set",         .method=HTTP_GET, .handler=handle_set         },
-        { .uri="/params",      .method=HTTP_GET, .handler=handle_params      },
-        { .uri="/params/save", .method=HTTP_GET, .handler=handle_params_save },
-    };
-    for (int i = 0; i < 5; i++)
-        httpd_register_uri_handler(server, &routes[i]);
-    ESP_LOGI(TAG, "Web server started.");
+    register_debug_routes(server);
+    ESP_LOGI(TAG, "STA web server up.");
 }
 
-// ──────────────────────────────────────────────────────────
-// Main
-// ──────────────────────────────────────────────────────────
-
-static void render_task(void *arg)
+static void start_webserver_ap(void)
 {
-    led_strip_handle_t strip = (led_strip_handle_t)arg;
-    float time_f = 0.0f;
-    while (1) {
-        float current_phase = manual_mode ? manual_phase : calc_moon_phase();
-        render_moon(strip, current_phase, time_f);
-        time_f += (p_glimmer_speed * 0.001f) * 50.0f;
-        vTaskDelay(pdMS_TO_TICKS(50));
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 16;
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start AP web server");
+        return;
     }
+    httpd_uri_t ap_routes[] = {
+        { .uri="/",      .method=HTTP_GET,  .handler=handle_setup_root },
+        { .uri="/scan",  .method=HTTP_GET,  .handler=handle_scan       },
+        { .uri="/setup", .method=HTTP_POST, .handler=handle_setup_post },
+    };
+    for (size_t i = 0; i < sizeof(ap_routes) / sizeof(ap_routes[0]); i++)
+        httpd_register_uri_handler(server, &ap_routes[i]);
+    // /debug routes are also available from the AP for on-bench tuning.
+    register_debug_routes(server);
+    ESP_LOGI(TAG, "AP web server up.");
 }
+
+// ──────────────────────────────────────────────────────────
+// app_main
+// ──────────────────────────────────────────────────────────
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "Phase firmware version: %s", FW_VERSION);
 
     led_mutex = xSemaphoreCreateMutex();
+    s_events  = xEventGroupCreate();
+    make_session_token();
 
-    nvs_flash_init();
+    // NVS first so we can read params and (maybe) Wi-Fi creds.
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
     nvs_load_params();
 
+    // LED strip — SK6812 RGBW, GRBW byte order on the wire.
     led_strip_config_t strip_config = {
-        .strip_gpio_num = LED_GPIO,
-        .max_leds       = LED_COUNT,
+        .strip_gpio_num         = LED_GPIO,
+        .max_leds               = LED_COUNT,
+        .led_model              = LED_MODEL_SK6812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRBW,
+        .flags                  = { .invert_out = false },
     };
     led_strip_rmt_config_t rmt_config = {
         .resolution_hz     = LED_RMT_RES_HZ,
-        // Larger RMT FIFO = more slack before a delayed refill ISR corrupts the
-        // frame. Default 64 is marginal on C3 with Wi-Fi running; 128 fits in
-        // one channel's symbol memory.
+        // Doubled RMT FIFO — see prototype-02.1 commit a13ae3e for context.
         .mem_block_symbols = 128,
     };
-    led_strip_handle_t strip;
-    led_strip_new_rmt_device(&strip_config, &rmt_config, &strip);
-
-    wifi_init();
-    time_sync();
-    start_webserver();
+    if (led_strip_new_rmt_device(&strip_config, &rmt_config, &s_strip) != ESP_OK) {
+        ESP_LOGE(TAG, "led_strip_new_rmt_device failed");
+    }
+    led_strip_clear(s_strip);
     init_glimmer();
 
+    // Render + button tasks come up first so the LEDs respond from boot.
+    xTaskCreate(render_task, "render", 4096, NULL,
+                configMAX_PRIORITIES - 3, NULL);
+    xTaskCreate(button_task, "button", 2048, NULL,
+                tskIDLE_PRIORITY + 2, NULL);
+
+    // Decide AP vs STA based on saved creds.
+    char ssid[64] = {0}, pass[64] = {0};
+    bool have_creds = load_wifi_creds(ssid, sizeof(ssid), pass, sizeof(pass));
+
+    if (!have_creds) {
+        ESP_LOGI(TAG, "No saved Wi-Fi creds — entering AP provisioning mode.");
+        s_anim_mode = ANIM_BOOT;
+        wifi_init_ap();
+        mdns_setup();
+        start_webserver_ap();
+        // Park here forever; the /setup POST handler triggers esp_restart()
+        // once the user has saved credentials.
+        vTaskDelay(portMAX_DELAY);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Have creds — STA mode, will connect to \"%s\".", ssid);
+    s_anim_mode = ANIM_BOOT;        // boot animation while we negotiate
+    wifi_init_sta_with_creds(ssid, pass);
+    xEventGroupWaitBits(s_events, EV_GOT_IP, false, true, portMAX_DELAY);
+
+    // Connected — play 3 blue pulses, then drop into normal moon mode.
+    s_anim_mode = ANIM_CONNECTING;
+    xEventGroupWaitBits(s_events, EV_CONNECTING_DONE, true, true, portMAX_DELAY);
+
+    mdns_setup();
+    start_webserver_sta();
+    time_sync();
+
+    s_anim_mode = ANIM_MOON;
     float phase = calc_moon_phase();
     ESP_LOGI(TAG, "Moon phase: %.3f  %s  %.1f%%",
              phase, phase_name(phase),
              phase_to_illumination(phase) * 100.0f);
-
-    // Dedicated, high-priority task so the HTTP server and Wi-Fi housekeeping
-    // can't starve the render loop.
-    xTaskCreate(render_task, "render", 4096, strip,
-                configMAX_PRIORITIES - 3, NULL);
 }
-
