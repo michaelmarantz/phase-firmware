@@ -945,6 +945,21 @@ static const char *DEBUG_PAGE =
 "</div>"
 "<script>"
 "var isManual=false;"
+// Trailing-edge throttle: fire immediately, then suppress further calls
+// within `ms` and dispatch the latest value once the window closes.
+// Otherwise rapid slider drags flood the C3's HTTPD queue and the LEDs
+// visibly chase the cursor.
+"function makeThrottle(fn,ms){var last=0,t=null,pendingArgs=null;"
+"return function(){pendingArgs=arguments;var now=Date.now();"
+"if(now-last>=ms){last=now;fn.apply(null,pendingArgs);pendingArgs=null;"
+"if(t){clearTimeout(t);t=null;}}"
+"else if(!t){var wait=ms-(now-last);"
+"t=setTimeout(function(){last=Date.now();t=null;"
+"if(pendingArgs){fn.apply(null,pendingArgs);pendingArgs=null;}},wait);}};}"
+"var sendPhaseTh=makeThrottle(function(p){"
+"var url=p<0?'/debug/set?mode=real':'/debug/set?mode=manual&phase='+p.toFixed(4);"
+"fetch(url).catch(function(){});},60);"
+"var sendParamsTh=makeThrottle(function(q){fetch(q).catch(function(){});},80);"
 "function phaseName(p){"
 "var ill=0.5-0.5*Math.cos(p*2*Math.PI);"
 "if(ill<0.02)return'New Moon';"
@@ -978,9 +993,7 @@ static const char *DEBUG_PAGE =
 "if(p<0)p+=1.0;"
 "document.getElementById('slider').value=Math.round(p*1000);"
 "updateDisplay(p);sendPhase(p);}"
-"function sendPhase(p){"
-"var url=p<0?'/debug/set?mode=real':'/debug/set?mode=manual&phase='+p.toFixed(4);"
-"fetch(url).catch(function(){});}"
+"function sendPhase(p){sendPhaseTh(p);}"
 "function onParam(){"
 "var q1=document.getElementById('s-q1').value/1000.0;"
 "var g1=document.getElementById('s-g1').value/1000.0;"
@@ -1002,12 +1015,12 @@ static const char *DEBUG_PAGE =
 "document.getElementById('lbl-gbase').textContent=gbase.toFixed(3);"
 "document.getElementById('lbl-gedge').textContent=gedge.toFixed(3);"
 "document.getElementById('lbl-gspeed').textContent=gspeed.toFixed(3);"
-"fetch('/debug/params?q1='+q1.toFixed(3)+'&g1='+g1.toFixed(3)"
+"sendParamsTh('/debug/params?q1='+q1.toFixed(3)+'&g1='+g1.toFixed(3)"
 "+'&g3='+g3.toFixed(3)+'&q3='+q3.toFixed(3)"
 "+'&bright='+bright.toFixed(3)+'&grad='+grad.toFixed(3)"
 "+'&floor='+floor.toFixed(3)"
 "+'&gbase='+gbase.toFixed(3)+'&gedge='+gedge.toFixed(3)"
-"+'&gspeed='+gspeed.toFixed(3)).catch(function(){});}"
+"+'&gspeed='+gspeed.toFixed(3));}"
 "function setGlimmer(on){"
 "document.getElementById('btn-gon-off').classList.toggle('active',!on);"
 "document.getElementById('btn-gon-on').classList.toggle('active',on);"
@@ -1402,6 +1415,9 @@ static void start_webserver_sta(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 16;
+    // Recycle oldest socket when the table fills, so a slider flood can't
+    // wedge the server against the connection limit.
+    config.lru_purge_enable = true;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start STA web server");
@@ -1415,6 +1431,9 @@ static void start_webserver_ap(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 16;
+    // Recycle oldest socket when the table fills, so a slider flood can't
+    // wedge the server against the connection limit.
+    config.lru_purge_enable = true;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start AP web server");
