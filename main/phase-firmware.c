@@ -97,7 +97,7 @@
 #define RENDER_PERIOD_MS       20      // 50 FPS — smooth enough that slow brightness fades look continuous
 #define BOOT_ANIM_DIM          0.50f   // boot blue brightness cap
 #define BOOT_ANIM_CYCLE_SEC    25.0f   // seconds per new-moon → full-moon → new-moon cycle
-#define CONNECTING_PULSE_HZ    1.0f    // pulse rate during ANIM_CONNECTING
+#define CONNECTING_PULSE_HZ    0.25f   // pulse rate during ANIM_CONNECTING (4 s per full pulse)
 #define CONNECTING_PULSE_DIM   0.65f   // peak brightness of the connecting pulse
 #define CONNECTING_PULSE_COUNT 3
 
@@ -452,6 +452,71 @@ static void compute_moon_frame(float phase, float time_f, float breath_t)
     }
 }
 
+// Dedicated boot animation. Same moon-shape rendering as compute_moon_frame
+// but completely independent of the user's debug parameters — no apply_curve
+// (so no plateaus from q1/g1/g3/q3), no p_brightness, no p_floor, no glimmer.
+// Just a smooth sin² illumination sweep that follows the moon-phase shape.
+static void compute_boot_frame(float boot_phase)
+{
+    // sin²(phase·π) gives 0 → 1 → 0 over phase 0 → 1, smooth at both ends.
+    float s        = sinf(boot_phase * (float)M_PI);
+    float ill      = s * s;
+    float lit_arc  = ill * 360.0f;
+
+    float lit_center;
+    float flip_window = 0.04f;
+    if (boot_phase < 0.5f - flip_window) {
+        lit_center = 90.0f;
+    } else if (boot_phase > 0.5f + flip_window) {
+        lit_center = 270.0f;
+    } else {
+        float t = (boot_phase - (0.5f - flip_window)) / (2.0f * flip_window);
+        float smooth_t = t * t * (3.0f - 2.0f * t);
+        lit_center = 90.0f + smooth_t * 180.0f;
+    }
+
+    // Fixed gradient width & face fade — don't pull from the debug params.
+    const float BOOT_GRADIENT_WIDTH  = 0.25f;
+    const float BOOT_FACE_GRADIENT   = 0.20f;
+
+    float gradient_deg = BOOT_GRADIENT_WIDTH * 360.0f;
+    float max_gradient = lit_arc * 0.25f;
+    if (gradient_deg > max_gradient) gradient_deg = max_gradient;
+
+    // Taper face gradient at high illumination (same logic as moon mode) so
+    // there's no visible rotation at the full-moon peak of the sweep.
+    float fade = ill * ill * (3.0f - 2.0f * ill);
+    float face_grad_eff = BOOT_FACE_GRADIENT * (1.0f - fade);
+
+    for (int i = 0; i < LED_COUNT; i++) {
+        float angle = led_angle_lut[i];
+        float rel   = angle - lit_center;
+        if (rel >  180.0f) rel -= 360.0f;
+        if (rel < -180.0f) rel += 360.0f;
+
+        float half_arc   = lit_arc * 0.5f;
+        float dist       = fabsf(rel) - half_arc;
+        float brightness = 0.0f;
+
+        if (dist < -gradient_deg) {
+            float depth = 0.0f;
+            if (half_arc > 0.0f) depth = (-dist) / half_arc;
+            if (depth > 1.0f) depth = 1.0f;
+            brightness = 1.0f - depth * face_grad_eff;
+        } else if (dist > gradient_deg) {
+            brightness = 0.0f;
+        } else {
+            float t = dist / gradient_deg;
+            brightness = 0.5f - 0.5f * sinf(t * ((float)M_PI / 2.0f));
+        }
+
+        brightness *= BOOT_ANIM_DIM;
+        if (brightness < 0.0f) brightness = 0.0f;
+        if (brightness > 1.0f) brightness = 1.0f;
+        frame_b[i] = brightness;
+    }
+}
+
 // Drive the W channel from frame_b[] (R=G=B=0).
 static void output_white(void)
 {
@@ -533,8 +598,9 @@ static void render_task(void *arg)
 
         switch (mode) {
         case ANIM_BOOT: {
-            compute_moon_frame(boot_phase, time_f, breath_t);
-            for (int i = 0; i < LED_COUNT; i++) frame_b[i] *= BOOT_ANIM_DIM;
+            // Dedicated boot renderer — smooth sin² sweep, no debug params.
+            // BOOT_ANIM_DIM is applied inside compute_boot_frame.
+            compute_boot_frame(boot_phase);
             output_blue();
             boot_phase = fmodf(boot_phase + boot_dphase, 1.0f);
             break;
