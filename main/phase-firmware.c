@@ -333,16 +333,23 @@ static float apply_curve(float phase)
 // LED 0 sits at 12 o'clock; indices advance clockwise. Angle 0° = 12 o'clock.
 // (lit_center swings 90° → 270° for waxing → waning, matching N-hemisphere
 //  moon orientation when angle 90° = 3 o'clock side.)
-static float led_angle(int i)
-{
-    return fmodf((float)i * (360.0f / (float)LED_COUNT), 360.0f);
-}
+//
+// Pre-computed in init_geometry() so the render loop doesn't pay for 138
+// fmodf calls every frame. C3 has no FPU — every avoided float op matters.
+static float led_angle_lut[LED_COUNT];
 
 static float   glimmer_offset[LED_COUNT];
 static float   glimmer_rate[LED_COUNT];
 static float   frame_b[LED_COUNT];       // brightness per pixel, 0..1
 static uint8_t last_out[LED_COUNT][4];   // last R,G,B,W actually sent
 static bool    last_out_valid = false;
+
+static void init_geometry(void)
+{
+    for (int i = 0; i < LED_COUNT; i++) {
+        led_angle_lut[i] = (float)i * (360.0f / (float)LED_COUNT);
+    }
+}
 
 static void init_glimmer(void)
 {
@@ -364,9 +371,14 @@ static float glimmer_value(int led, float time_f, float edge_proximity)
 // Fill frame_b[] with brightness 0..1 for the given moon phase.
 // (Same math as legacy render_moon — separated from the output stage so the
 //  boot animation can recolor the same shape.)
-static void compute_moon_frame(float phase, float time_f)
+//
+// breath_t is a real-time seconds accumulator independent of glimmer speed,
+// used for the always-on subtle global breathing modulation that gives the
+// moon "life" near full without revealing the rotational center.
+static void compute_moon_frame(float phase, float time_f, float breath_t)
 {
-    float lit_arc = apply_curve(phase);
+    float lit_arc      = apply_curve(phase);
+    float lit_fraction = lit_arc * (1.0f / 360.0f);   // 0 (new) … 1 (full)
 
     float lit_center;
     float flip_window = 0.04f;
@@ -384,13 +396,30 @@ static void compute_moon_frame(float phase, float time_f)
     float max_gradient = lit_arc * 0.25f;
     if (gradient_deg > max_gradient) gradient_deg = max_gradient;
 
-    for (int i = 0; i < LED_COUNT; i++) {
-        float angle = led_angle(i);
-        float rel   = angle - lit_center;
-        while (rel >  180.0f) rel -= 360.0f;
-        while (rel < -180.0f) rel += 360.0f;
+    // Taper the face-gradient strength as the ring fills up. At full moon
+    // (lit_fraction = 1) the gradient vanishes entirely, so the lit_center
+    // position becomes invisible and the lit_center flip can't be seen as a
+    // 180° rotation. Smoothstep makes the taper gentle, not sudden.
+    float ft = lit_fraction;
+    if (ft > 1.0f) ft = 1.0f;
+    float fade = ft * ft * (3.0f - 2.0f * ft);     // smoothstep(0,1,lit_fraction)
+    float face_grad_eff = p_face_gradient * (1.0f - fade);
 
-        float half_arc       = lit_arc / 2.0f;
+    // Global breath modulation. Amplitude scales with lit_fraction so it's
+    // imperceptible at crescent phases but provides quiet life at full.
+    // Period ~6 s.
+    float breath_amp = 0.06f * lit_fraction;
+    float breath_mod = 1.0f - breath_amp +
+                       breath_amp * (0.5f + 0.5f * sinf(breath_t * (2.0f * (float)M_PI / 6.0f)));
+
+    for (int i = 0; i < LED_COUNT; i++) {
+        float angle = led_angle_lut[i];
+        float rel   = angle - lit_center;
+        // Branchless wrap — fabsf is cheap, while-loops can iterate twice.
+        if (rel >  180.0f) rel -= 360.0f;
+        if (rel < -180.0f) rel += 360.0f;
+
+        float half_arc       = lit_arc * 0.5f;
         float dist           = fabsf(rel) - half_arc;
         float brightness     = 0.0f;
         float edge_proximity = 0.0f;
@@ -399,7 +428,7 @@ static void compute_moon_frame(float phase, float time_f)
             float depth = 0.0f;
             if (half_arc > 0.0f) depth = (-dist) / half_arc;
             if (depth > 1.0f) depth = 1.0f;
-            brightness = 1.0f - depth * p_face_gradient;
+            brightness = 1.0f - depth * face_grad_eff;
         } else if (dist > gradient_deg) {
             brightness = 0.0f;
         } else {
@@ -411,7 +440,7 @@ static void compute_moon_frame(float phase, float time_f)
         if (p_glimmer_on && brightness > 0.01f)
             brightness *= glimmer_value(i, time_f, edge_proximity);
 
-        brightness *= p_brightness;
+        brightness *= p_brightness * breath_mod;
         if (brightness < p_floor) brightness = 0.0f;
 
         if (brightness < 0.0f) brightness = 0.0f;
@@ -482,6 +511,7 @@ static void render_task(void *arg)
     const float boot_dphase  = frame_sec / BOOT_ANIM_CYCLE_SEC;        // phase units per frame
     const float pulse_dt     = frame_sec * CONNECTING_PULSE_HZ;        // 0..1 per pulse cycle
     float time_f      = 0.0f;
+    float breath_t    = 0.0f;   // real-time seconds — independent of glimmer speed
     float boot_phase  = 0.0f;
     float pulse_t     = 0.0f;
     int   pulse_count = 0;
@@ -500,7 +530,7 @@ static void render_task(void *arg)
 
         switch (mode) {
         case ANIM_BOOT: {
-            compute_moon_frame(boot_phase, time_f);
+            compute_moon_frame(boot_phase, time_f, breath_t);
             for (int i = 0; i < LED_COUNT; i++) frame_b[i] *= BOOT_ANIM_DIM;
             output_blue();
             boot_phase = fmodf(boot_phase + boot_dphase, 1.0f);
@@ -525,7 +555,7 @@ static void render_task(void *arg)
         case ANIM_MOON:
         default: {
             float phase = manual_mode ? manual_phase : calc_moon_phase();
-            compute_moon_frame(phase, time_f);
+            compute_moon_frame(phase, time_f, breath_t);
             output_white();
             break;
         }
@@ -533,7 +563,8 @@ static void render_task(void *arg)
 
         // Glimmer time base advances in real seconds × p_glimmer_speed,
         // so animation speed is independent of RENDER_PERIOD_MS.
-        time_f += p_glimmer_speed * frame_sec;
+        time_f   += p_glimmer_speed * frame_sec;
+        breath_t += frame_sec;
         vTaskDelay(pdMS_TO_TICKS(RENDER_PERIOD_MS));
     }
 }
@@ -651,11 +682,15 @@ static void wifi_init_ap(void)
 
     wifi_config_t ap_cfg = {
         .ap = {
-            .ssid           = AP_SSID,
-            .ssid_len       = (uint8_t)strlen(AP_SSID),
-            .channel        = 6,
-            .authmode       = WIFI_AUTH_OPEN,
-            .max_connection = 4,
+            .ssid            = AP_SSID,
+            .ssid_len        = (uint8_t)strlen(AP_SSID),
+            .channel         = 6,
+            .authmode        = WIFI_AUTH_OPEN,
+            .max_connection  = 4,
+            // Default beacon interval is 100 ms — every beacon broadcast
+            // is an ISR that can preempt the render task. 400 ms is still
+            // fine for client discovery and frees a lot of slack.
+            .beacon_interval = 400,
         },
     };
 
@@ -1434,6 +1469,7 @@ void app_main(void)
         ESP_LOGE(TAG, "led_strip_new_rmt_device failed");
     }
     led_strip_clear(s_strip);
+    init_geometry();
     init_glimmer();
 
     // Render + button tasks come up first so the LEDs respond from boot.
