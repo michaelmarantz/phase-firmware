@@ -91,8 +91,10 @@
 #define DEFAULT_CURVE_Q3       0.255f
 
 // ── Animation knobs ────────────────────────────────────────
+#define RENDER_PERIOD_MS       20      // 50 FPS — smooth enough that slow brightness fades look continuous
 #define BOOT_ANIM_DIM          0.50f   // boot blue brightness cap
-#define BOOT_ANIM_PHASE_RATE   0.04f   // phase increments per render step (~25 s/cycle at 50 ms)
+#define BOOT_ANIM_CYCLE_SEC    25.0f   // seconds per new-moon → full-moon → new-moon cycle
+#define CONNECTING_PULSE_HZ    1.0f    // pulse rate during ANIM_CONNECTING
 #define CONNECTING_PULSE_DIM   0.65f   // peak brightness of the connecting pulse
 #define CONNECTING_PULSE_COUNT 3
 
@@ -476,6 +478,9 @@ static void output_blue(void)
 static void render_task(void *arg)
 {
     (void)arg;
+    const float frame_sec    = (float)RENDER_PERIOD_MS / 1000.0f;
+    const float boot_dphase  = frame_sec / BOOT_ANIM_CYCLE_SEC;        // phase units per frame
+    const float pulse_dt     = frame_sec * CONNECTING_PULSE_HZ;        // 0..1 per pulse cycle
     float time_f      = 0.0f;
     float boot_phase  = 0.0f;
     float pulse_t     = 0.0f;
@@ -498,16 +503,16 @@ static void render_task(void *arg)
             compute_moon_frame(boot_phase, time_f);
             for (int i = 0; i < LED_COUNT; i++) frame_b[i] *= BOOT_ANIM_DIM;
             output_blue();
-            boot_phase = fmodf(boot_phase + BOOT_ANIM_PHASE_RATE * 0.05f, 1.0f);
+            boot_phase = fmodf(boot_phase + boot_dphase, 1.0f);
             break;
         }
         case ANIM_CONNECTING: {
-            // 1 Hz pulse, peak at CONNECTING_PULSE_DIM, stop after N pulses.
+            // Peak at CONNECTING_PULSE_DIM, stop after CONNECTING_PULSE_COUNT pulses.
             float bright = CONNECTING_PULSE_DIM *
                            (0.5f - 0.5f * cosf(pulse_t * 2.0f * (float)M_PI));
             for (int i = 0; i < LED_COUNT; i++) frame_b[i] = bright;
             output_blue();
-            pulse_t += 0.05f;
+            pulse_t += pulse_dt;
             if (pulse_t >= 1.0f) {
                 pulse_t = 0.0f;
                 pulse_count++;
@@ -526,8 +531,10 @@ static void render_task(void *arg)
         }
         }
 
-        time_f += (p_glimmer_speed * 0.001f) * 50.0f;
-        vTaskDelay(pdMS_TO_TICKS(50));
+        // Glimmer time base advances in real seconds × p_glimmer_speed,
+        // so animation speed is independent of RENDER_PERIOD_MS.
+        time_f += p_glimmer_speed * frame_sec;
+        vTaskDelay(pdMS_TO_TICKS(RENDER_PERIOD_MS));
     }
 }
 
