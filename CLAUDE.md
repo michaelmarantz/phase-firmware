@@ -5,11 +5,12 @@ ESP-IDF firmware for the Phase lamp — an ESP32-C3 driving a ring of addressabl
 ## Hardware (edition00)
 
 - **MCU:** ESP32-C3 (RISC-V, single-core, 2 MB flash)
-- **LEDs:** 138× **SK6812 RGBW** on **GPIO 21**, GRBW byte order, driven via RMT at 10 MHz
+- **LEDs:** 138× **SK6812 RGBW** on **GPIO 8**, GRBW byte order, driven via RMT at 10 MHz
 - LED 0 sits at **12 o'clock**; indices advance clockwise (`led_angle(i) = i * 360 / 138`)
 - **Color:** W channel only for moon rendering (R=G=B=0); B channel used for boot AP + Wi-Fi-connecting animations
 - **Reset button:** GPIO 20, active-low, internal pull-up. Hold 3 s to erase Wi-Fi creds and reboot
-- **UART caveat:** GPIO 21 = U0TXD, GPIO 20 = U0RXD — both pins are repurposed. RMT takes over GPIO 21 so LED data is fine; serial logs only show up on the secondary USB Serial/JTAG console (GPIO 18/19)
+- **UART note:** GPIO 20 is the default UART0 RX (unused). Serial logs flow over the secondary USB Serial/JTAG console (GPIO 18/19), so UART0 is never in the way at runtime
+- **GPIO 8 caveat:** GPIO 8 is a strapping pin (selects whether bootloader logging is enabled). It works fine for RMT output at runtime, but the next board respin should move the data line to **GPIO 3/4/5/6/7/10** to avoid any strapping interaction at boot. (The v1 phase board originally wired data to GPIO 21, but that trace doesn't pass signal on this revision — confirmed by repeating with WLED. Moving to GPIO 8 made the strip light up.)
 
 Previous revisions: `prototype-02.x` = 52× WS2812 on GPIO 2; `prototype-04` = 90× WS2812 on GPIO 2.
 

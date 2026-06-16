@@ -2,7 +2,7 @@
 //  Phase firmware — edition00
 //
 //  Hardware:
-//    SK6812 RGBW × 138 on GPIO 21, reset button on GPIO 20.
+//    SK6812 RGBW × 138 on GPIO 8, reset button on GPIO 20.
 //    LED 0 sits at 12 o'clock; indices advance clockwise.
 //    Only the W channel is driven for normal moon rendering; the B channel
 //    is used for the boot-AP and Wi-Fi-connecting animations.
@@ -22,10 +22,9 @@
 //  Reset button: hold GPIO 20 (active-low, internal pull-up) for 3 s to
 //    erase Wi-Fi credentials and reboot to AP mode.
 //
-//  Note on UART: GPIO 21/20 are the default UART0 TX/RX pins. The RMT
-//    peripheral takes over GPIO 21 so it can drive the LED data line; UART
-//    output on that pin goes nowhere. Logs still flow through the secondary
-//    USB-Serial/JTAG console (GPIO 18/19).
+//  Note on UART: GPIO 20 (button) is the default UART0 RX, which we don't
+//    need. Console logs flow over the secondary USB-Serial/JTAG console
+//    (GPIO 18/19), so we never depend on UART0 at runtime.
 // ════════════════════════════════════════════════════════════════════════
 
 #include <stdio.h>
@@ -54,7 +53,12 @@
 #include "led_strip.h"
 
 // ── Hardware ───────────────────────────────────────────────
-#define LED_GPIO         21
+// LED_GPIO was originally 21, but on the v1 phase board the GPIO 21 trace
+// to the strip's DIN doesn't pass signal — confirmed by swapping to GPIO 8
+// with WLED, which then drove the strip. GPIO 8 is a strapping pin (boot
+// log enable); fine for runtime use, but for the next board respin route
+// data through GPIO 3/4/5/6/7/10 instead — those are clean.
+#define LED_GPIO         8
 #define BUTTON_GPIO      20
 #define LED_COUNT        138
 #define LED_RMT_RES_HZ   10000000
