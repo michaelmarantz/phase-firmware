@@ -2,7 +2,7 @@
 //  Phase firmware — edition00
 //
 //  Hardware:
-//    SK6812 RGBW × 138 on GPIO 8, reset button on GPIO 6 (D6).
+//    SK6812 RGBW × 138 on GPIO 8, reset button on GPIO 5 (D5).
 //    LED 0 sits at 12 o'clock; indices advance clockwise.
 //    Only the W channel is driven for normal moon rendering; the B channel
 //    is used for the boot-AP and Wi-Fi-connecting animations.
@@ -19,7 +19,7 @@
 //               existing curve / brightness / face-gradient sliders plus
 //               phase scrubber, date picker, manual/real toggle.
 //
-//  Reset button: hold GPIO 6 / D6 (active-low, internal pull-up) for 3 s
+//  Reset button: hold GPIO 5 / D5 (active-low, internal pull-up) for 3 s
 //    to erase Wi-Fi credentials and reboot to AP mode.
 //
 //  Note on UART: console logs flow over the secondary USB-Serial/JTAG
@@ -60,7 +60,7 @@
 // log enable); fine for runtime use, but for the next board respin route
 // data through GPIO 3/4/5/6/7/10 instead — those are clean.
 #define LED_GPIO         8
-#define BUTTON_GPIO      6   // labelled D6 on the phase board silkscreen
+#define BUTTON_GPIO      5   // labelled D5 on the phase board silkscreen
 #define LED_COUNT        138
 #define LED_RMT_RES_HZ   10000000
 
@@ -589,8 +589,8 @@ static void button_task(void *arg)
     ESP_LOGI(TAG, "Reset button task started on GPIO %d (pull-up, active-low). Idle level=%d (expect 1).",
              BUTTON_GPIO, initial);
 
-    int held_ms   = 0;
-    int last_lvl  = initial;
+    int held_ms  = 0;
+    int last_lvl = initial;
     while (1) {
         int lvl = gpio_get_level(BUTTON_GPIO);
         if (lvl != last_lvl) {
