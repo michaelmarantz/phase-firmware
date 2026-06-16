@@ -92,6 +92,9 @@
 #define DEFAULT_CURVE_G1       0.501f
 #define DEFAULT_CURVE_G3       0.500f
 #define DEFAULT_CURVE_Q3       0.255f
+// USB-safe by default: 138 SK6812 × 20 mA × 0.30 ≈ 830 mA peak.
+// Crank to 1.0 when running on the external APV-35-5 supply.
+#define DEFAULT_POWER_CAP      0.30f
 
 // ── Animation knobs ────────────────────────────────────────
 #define RENDER_PERIOD_MS       20      // 50 FPS — smooth enough that slow brightness fades look continuous
@@ -164,6 +167,9 @@ static float p_curve_q1      = DEFAULT_CURVE_Q1;
 static float p_curve_g1      = DEFAULT_CURVE_G1;
 static float p_curve_g3      = DEFAULT_CURVE_G3;
 static float p_curve_q3      = DEFAULT_CURVE_Q3;
+// Hard ceiling on output regardless of p_brightness — applied in every
+// output_* function. Defaults USB-safe; raise to ~1.0 on external 5 V supply.
+static float p_power_cap     = DEFAULT_POWER_CAP;
 
 // ── Manual override ────────────────────────────────────────
 static bool  manual_mode  = false;
@@ -192,6 +198,7 @@ static void nvs_save_params(void)
     nvs_set_i32(h, "curve_g1",      (int32_t)(p_curve_g1      * 1000));
     nvs_set_i32(h, "curve_g3",      (int32_t)(p_curve_g3      * 1000));
     nvs_set_i32(h, "curve_q3",      (int32_t)(p_curve_q3      * 1000));
+    nvs_set_i32(h, "power_cap",     (int32_t)(p_power_cap     * 1000));
     nvs_commit(h);
     nvs_close(h);
     xSemaphoreGive(led_mutex);
@@ -215,6 +222,7 @@ static void nvs_load_params(void)
     if (nvs_get_i32(h, "curve_g1",      &v) == ESP_OK) p_curve_g1      = v / 1000.0f;
     if (nvs_get_i32(h, "curve_g3",      &v) == ESP_OK) p_curve_g3      = v / 1000.0f;
     if (nvs_get_i32(h, "curve_q3",      &v) == ESP_OK) p_curve_q3      = v / 1000.0f;
+    if (nvs_get_i32(h, "power_cap",     &v) == ESP_OK) p_power_cap     = v / 1000.0f;
     nvs_close(h);
     ESP_LOGI(TAG, "Loaded params. q1=%.3f g1=%.3f g3=%.3f q3=%.3f",
              p_curve_q1, p_curve_g1, p_curve_g3, p_curve_q3);
@@ -526,12 +534,15 @@ static void compute_boot_frame(float boot_phase)
 // Drive the W channel from frame_b[] (R=G=B=0).
 static void output_white(void)
 {
+    float cap = p_power_cap;
+    if (cap < 0.0f) cap = 0.0f;
+    if (cap > 1.0f) cap = 1.0f;
     uint8_t out[LED_COUNT][4];
     for (int i = 0; i < LED_COUNT; i++) {
         out[i][0] = 0;
         out[i][1] = 0;
         out[i][2] = 0;
-        out[i][3] = (uint8_t)(frame_b[i] * 255.0f);
+        out[i][3] = (uint8_t)(frame_b[i] * cap * 255.0f);
     }
     bool changed = !last_out_valid ||
                    memcmp(out, last_out, sizeof(out)) != 0;
@@ -552,9 +563,12 @@ static void output_white(void)
 // ANIM_CONNECT_FAILED to flash red before falling back to AP mode.
 static void output_red(void)
 {
+    float cap = p_power_cap;
+    if (cap < 0.0f) cap = 0.0f;
+    if (cap > 1.0f) cap = 1.0f;
     uint8_t out[LED_COUNT][4];
     for (int i = 0; i < LED_COUNT; i++) {
-        out[i][0] = (uint8_t)(frame_b[i] * 255.0f);
+        out[i][0] = (uint8_t)(frame_b[i] * cap * 255.0f);
         out[i][1] = 0;
         out[i][2] = 0;
         out[i][3] = 0;
@@ -578,11 +592,14 @@ static void output_red(void)
 // "connecting" animations.
 static void output_blue(void)
 {
+    float cap = p_power_cap;
+    if (cap < 0.0f) cap = 0.0f;
+    if (cap > 1.0f) cap = 1.0f;
     uint8_t out[LED_COUNT][4];
     for (int i = 0; i < LED_COUNT; i++) {
         out[i][0] = 0;
         out[i][1] = 0;
-        out[i][2] = (uint8_t)(frame_b[i] * 255.0f);
+        out[i][2] = (uint8_t)(frame_b[i] * cap * 255.0f);
         out[i][3] = 0;
     }
     bool changed = !last_out_valid ||
@@ -1034,6 +1051,9 @@ static const char *DEBUG_PAGE =
 "<div class='note'>How lit the ring looks at last quarter. Lower = less lit.</div>"
 "<hr/>"
 "<div class='section-title'>Rendering Parameters</div>"
+"<label>Power cap<span id='lbl-pcap'></span></label>"
+"<input type='range' id='s-pcap' min='100' max='1000' oninput='onParam()'/>"
+"<div class='note'>Hard ceiling on output current. Keep at 30% if powered through a USB hub (≈ 800 mA peak). Set to 100% on the external 5 V supply (APV-35-5).</div>"
 "<label>Brightness<span id='lbl-bright'></span></label>"
 "<input type='range' id='s-bright' min='100' max='1000' oninput='onParam()'/>"
 "<label>Face gradient<span id='lbl-grad'></span></label>"
@@ -1122,6 +1142,7 @@ static const char *DEBUG_PAGE =
 "var bright=document.getElementById('s-bright').value/1000.0;"
 "var grad=document.getElementById('s-grad').value/1000.0;"
 "var floor=document.getElementById('s-floor').value/1000.0;"
+"var pcap=document.getElementById('s-pcap').value/1000.0;"
 "var gbase=document.getElementById('s-gbase').value/1000.0;"
 "var gedge=document.getElementById('s-gedge').value/1000.0;"
 "var gspeed=document.getElementById('s-gspeed').value/1000.0;"
@@ -1132,13 +1153,14 @@ static const char *DEBUG_PAGE =
 "document.getElementById('lbl-bright').textContent=bright.toFixed(3);"
 "document.getElementById('lbl-grad').textContent=grad.toFixed(3);"
 "document.getElementById('lbl-floor').textContent=floor.toFixed(3);"
+"document.getElementById('lbl-pcap').textContent=pcap.toFixed(3);"
 "document.getElementById('lbl-gbase').textContent=gbase.toFixed(3);"
 "document.getElementById('lbl-gedge').textContent=gedge.toFixed(3);"
 "document.getElementById('lbl-gspeed').textContent=gspeed.toFixed(3);"
 "sendParamsTh('/debug/params?q1='+q1.toFixed(3)+'&g1='+g1.toFixed(3)"
 "+'&g3='+g3.toFixed(3)+'&q3='+q3.toFixed(3)"
 "+'&bright='+bright.toFixed(3)+'&grad='+grad.toFixed(3)"
-"+'&floor='+floor.toFixed(3)"
+"+'&floor='+floor.toFixed(3)+'&pcap='+pcap.toFixed(3)"
 "+'&gbase='+gbase.toFixed(3)+'&gedge='+gedge.toFixed(3)"
 "+'&gspeed='+gspeed.toFixed(3));}"
 "function setGlimmer(on){"
@@ -1163,6 +1185,7 @@ static const char *DEBUG_PAGE =
 "document.getElementById('s-bright').value=Math.round(d.bright*1000);"
 "document.getElementById('s-grad').value=Math.round(d.grad*1000);"
 "document.getElementById('s-floor').value=Math.round(d.floor*1000);"
+"document.getElementById('s-pcap').value=Math.round(d.pcap*1000);"
 "document.getElementById('s-gbase').value=Math.round(d.gbase*1000);"
 "document.getElementById('s-gedge').value=Math.round(d.gedge*1000);"
 "document.getElementById('s-gspeed').value=Math.round(d.gspeed*1000);"
@@ -1175,6 +1198,7 @@ static const char *DEBUG_PAGE =
 "document.getElementById('lbl-bright').textContent=d.bright.toFixed(3);"
 "document.getElementById('lbl-grad').textContent=d.grad.toFixed(3);"
 "document.getElementById('lbl-floor').textContent=d.floor.toFixed(3);"
+"document.getElementById('lbl-pcap').textContent=d.pcap.toFixed(3);"
 "document.getElementById('lbl-gbase').textContent=d.gbase.toFixed(3);"
 "document.getElementById('lbl-gedge').textContent=d.gedge.toFixed(3);"
 "document.getElementById('lbl-gspeed').textContent=d.gspeed.toFixed(3);"
@@ -1437,12 +1461,12 @@ static esp_err_t handle_status(httpd_req_t *req)
         "{\"phase\":%.4f,\"illumination\":%.1f,\"name\":\"%s\","
         "\"manual\":%s,\"ip\":\"%s\","
         "\"q1\":%.3f,\"g1\":%.3f,\"g3\":%.3f,\"q3\":%.3f,"
-        "\"bright\":%.3f,\"grad\":%.3f,\"floor\":%.3f,"
+        "\"bright\":%.3f,\"grad\":%.3f,\"floor\":%.3f,\"pcap\":%.3f,"
         "\"gon\":%s,\"gbase\":%.3f,\"gedge\":%.3f,\"gspeed\":%.3f}",
         phase, ill * 100.0f, phase_name(phase),
         manual_mode ? "true" : "false", ip_str,
         p_curve_q1, p_curve_g1, p_curve_g3, p_curve_q3,
-        p_brightness, p_face_gradient, p_floor,
+        p_brightness, p_face_gradient, p_floor, p_power_cap,
         p_glimmer_on ? "true" : "false",
         p_glimmer_base, p_glimmer_edge, p_glimmer_speed);
 
@@ -1491,6 +1515,12 @@ static esp_err_t handle_params(httpd_req_t *req)
         if (httpd_query_key_value(query, "bright",val, sizeof(val)) == ESP_OK) p_brightness    = strtof(val, NULL);
         if (httpd_query_key_value(query, "grad",  val, sizeof(val)) == ESP_OK) p_face_gradient = strtof(val, NULL);
         if (httpd_query_key_value(query, "floor", val, sizeof(val)) == ESP_OK) p_floor         = strtof(val, NULL);
+        if (httpd_query_key_value(query, "pcap",  val, sizeof(val)) == ESP_OK) {
+            float c = strtof(val, NULL);
+            if (c < 0.0f) c = 0.0f;
+            if (c > 1.0f) c = 1.0f;
+            p_power_cap = c;
+        }
         if (httpd_query_key_value(query, "gon",   val, sizeof(val)) == ESP_OK) p_glimmer_on    = (strcmp(val, "1") == 0);
         if (httpd_query_key_value(query, "gbase", val, sizeof(val)) == ESP_OK) p_glimmer_base  = strtof(val, NULL);
         if (httpd_query_key_value(query, "gedge", val, sizeof(val)) == ESP_OK) p_glimmer_edge  = strtof(val, NULL);
