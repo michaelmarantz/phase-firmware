@@ -100,6 +100,10 @@
 #define CONNECTING_PULSE_HZ    0.25f   // pulse rate during ANIM_CONNECTING (4 s per full pulse)
 #define CONNECTING_PULSE_DIM   0.65f   // peak brightness of the connecting pulse
 #define CONNECTING_PULSE_COUNT 3
+#define FAILED_PULSE_HZ        3.5f    // ~285 ms per pulse — quick, alarming
+#define FAILED_PULSE_DIM       0.70f
+#define FAILED_PULSE_COUNT     4
+#define WIFI_CONNECT_TIMEOUT_MS  60000 // give up after 60 s of failed connects
 
 // ── Logging tag ────────────────────────────────────────────
 #define TAG "phase"
@@ -123,9 +127,10 @@ static const char *phase_name(float phase);
 // ──────────────────────────────────────────────────────────
 
 typedef enum {
-    ANIM_BOOT       = 0,   // slow blue moon-phase cycle (AP/provisioning)
-    ANIM_CONNECTING = 1,   // 3 blue pulses while connecting
-    ANIM_MOON       = 2,   // normal moon render
+    ANIM_BOOT           = 0,   // slow blue moon-phase cycle (AP/provisioning)
+    ANIM_CONNECTING     = 1,   // 3 blue pulses while connecting
+    ANIM_MOON           = 2,   // normal moon render
+    ANIM_CONNECT_FAILED = 3,   // 4 quick red pulses before we wipe creds + reboot to AP
 } anim_mode_t;
 
 static volatile anim_mode_t s_anim_mode = ANIM_BOOT;
@@ -133,6 +138,7 @@ static volatile anim_mode_t s_anim_mode = ANIM_BOOT;
 static EventGroupHandle_t s_events;
 #define EV_GOT_IP            BIT0
 #define EV_CONNECTING_DONE   BIT1
+#define EV_FAILED_DONE       BIT2
 
 // Mutex serialising led_strip_refresh() against any flash-touching code
 // (NVS commit, scan, restart prep). Flash ops disable the CPU cache, which
@@ -542,6 +548,32 @@ static void output_white(void)
     last_out_valid = true;
 }
 
+// Drive only the R channel from frame_b[] (G=B=W=0). Used by
+// ANIM_CONNECT_FAILED to flash red before falling back to AP mode.
+static void output_red(void)
+{
+    uint8_t out[LED_COUNT][4];
+    for (int i = 0; i < LED_COUNT; i++) {
+        out[i][0] = (uint8_t)(frame_b[i] * 255.0f);
+        out[i][1] = 0;
+        out[i][2] = 0;
+        out[i][3] = 0;
+    }
+    bool changed = !last_out_valid ||
+                   memcmp(out, last_out, sizeof(out)) != 0;
+    if (!changed) return;
+
+    xSemaphoreTake(led_mutex, portMAX_DELAY);
+    for (int i = 0; i < LED_COUNT; i++) {
+        led_strip_set_pixel_rgbw(s_strip, i,
+            out[i][0], out[i][1], out[i][2], out[i][3]);
+    }
+    led_strip_refresh(s_strip);
+    xSemaphoreGive(led_mutex);
+    memcpy(last_out, out, sizeof(out));
+    last_out_valid = true;
+}
+
 // Drive only the B channel from frame_b[] (R=G=W=0). Used for boot AP +
 // "connecting" animations.
 static void output_blue(void)
@@ -617,6 +649,23 @@ static void render_task(void *arg)
                 pulse_count++;
                 if (pulse_count >= CONNECTING_PULSE_COUNT) {
                     xEventGroupSetBits(s_events, EV_CONNECTING_DONE);
+                }
+            }
+            break;
+        }
+        case ANIM_CONNECT_FAILED: {
+            // Quick red blips so the user knows the connect timed out before
+            // we wipe creds and reboot into AP mode.
+            float bright = FAILED_PULSE_DIM *
+                           (0.5f - 0.5f * cosf(pulse_t * 2.0f * (float)M_PI));
+            for (int i = 0; i < LED_COUNT; i++) frame_b[i] = bright;
+            output_red();
+            pulse_t += frame_sec * FAILED_PULSE_HZ;
+            if (pulse_t >= 1.0f) {
+                pulse_t = 0.0f;
+                pulse_count++;
+                if (pulse_count >= FAILED_PULSE_COUNT) {
+                    xEventGroupSetBits(s_events, EV_FAILED_DONE);
                 }
             }
             break;
@@ -1587,7 +1636,23 @@ void app_main(void)
     ESP_LOGI(TAG, "Have creds — STA mode, will connect to \"%s\".", ssid);
     s_anim_mode = ANIM_BOOT;        // boot animation while we negotiate
     wifi_init_sta_with_creds(ssid, pass);
-    xEventGroupWaitBits(s_events, EV_GOT_IP, false, true, portMAX_DELAY);
+
+    // Cap the connect attempt. If the saved network has vanished (moved,
+    // SSID changed, router dead) we'd otherwise sit in the blue boot
+    // animation forever. After WIFI_CONNECT_TIMEOUT_MS, blink red, wipe
+    // creds, and reboot into AP mode for re-provisioning.
+    EventBits_t bits = xEventGroupWaitBits(s_events, EV_GOT_IP, false, true,
+                                            pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+    if (!(bits & EV_GOT_IP)) {
+        ESP_LOGW(TAG, "Wi-Fi connect timed out after %d s — flashing red, wiping creds, rebooting to AP",
+                 WIFI_CONNECT_TIMEOUT_MS / 1000);
+        s_anim_mode = ANIM_CONNECT_FAILED;
+        xEventGroupWaitBits(s_events, EV_FAILED_DONE, true, true, portMAX_DELAY);
+        clear_wifi_creds();
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+        return;
+    }
 
     // Connected — play 3 blue pulses, then drop into normal moon mode.
     s_anim_mode = ANIM_CONNECTING;
