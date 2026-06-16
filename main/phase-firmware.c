@@ -2,7 +2,7 @@
 //  Phase firmware — edition00
 //
 //  Hardware:
-//    SK6812 RGBW × 138 on GPIO 8, reset button on GPIO 20.
+//    SK6812 RGBW × 138 on GPIO 8, reset button on GPIO 6 (D6).
 //    LED 0 sits at 12 o'clock; indices advance clockwise.
 //    Only the W channel is driven for normal moon rendering; the B channel
 //    is used for the boot-AP and Wi-Fi-connecting animations.
@@ -19,12 +19,13 @@
 //               existing curve / brightness / face-gradient sliders plus
 //               phase scrubber, date picker, manual/real toggle.
 //
-//  Reset button: hold GPIO 20 (active-low, internal pull-up) for 3 s to
-//    erase Wi-Fi credentials and reboot to AP mode.
+//  Reset button: hold GPIO 6 / D6 (active-low, internal pull-up) for 3 s
+//    to erase Wi-Fi credentials and reboot to AP mode.
 //
-//  Note on UART: GPIO 20 (button) is the default UART0 RX, which we don't
-//    need. Console logs flow over the secondary USB-Serial/JTAG console
-//    (GPIO 18/19), so we never depend on UART0 at runtime.
+//  Note on UART: console logs flow over the secondary USB-Serial/JTAG
+//    console (GPIO 18/19), so we never depend on UART0 (GPIO 20/21) at
+//    runtime — both default UART pins are free for whatever the board
+//    wires them to.
 // ════════════════════════════════════════════════════════════════════════
 
 #include <stdio.h>
@@ -59,7 +60,7 @@
 // log enable); fine for runtime use, but for the next board respin route
 // data through GPIO 3/4/5/6/7/10 instead — those are clean.
 #define LED_GPIO         8
-#define BUTTON_GPIO      20
+#define BUTTON_GPIO      6   // labelled D6 on the phase board silkscreen
 #define LED_COUNT        138
 #define LED_RMT_RES_HZ   10000000
 
@@ -584,22 +585,35 @@ static void button_task(void *arg)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&io);
+    int initial = gpio_get_level(BUTTON_GPIO);
+    ESP_LOGI(TAG, "Reset button task started on GPIO %d (pull-up, active-low). Idle level=%d (expect 1).",
+             BUTTON_GPIO, initial);
 
-    int held_ms = 0;
+    int held_ms   = 0;
+    int last_lvl  = initial;
     while (1) {
-        if (gpio_get_level(BUTTON_GPIO) == 0) {  // active low
+        int lvl = gpio_get_level(BUTTON_GPIO);
+        if (lvl != last_lvl) {
+            ESP_LOGI(TAG, "Button GPIO %d transition: %d → %d", BUTTON_GPIO, last_lvl, lvl);
+            last_lvl = lvl;
+        }
+        if (lvl == 0) {  // pressed (active low)
             held_ms += 50;
             if (held_ms == 1000 || held_ms == 2000) {
-                ESP_LOGI(TAG, "Reset button held %dms…", held_ms);
+                ESP_LOGI(TAG, "Reset button held %d ms…", held_ms);
             }
             if (held_ms >= BUTTON_HOLD_MS) {
-                ESP_LOGW(TAG, "Reset button held %dms — clearing Wi-Fi creds and rebooting",
+                ESP_LOGW(TAG, "Reset button held %d ms — clearing Wi-Fi creds and rebooting",
                          BUTTON_HOLD_MS);
                 clear_wifi_creds();
                 vTaskDelay(pdMS_TO_TICKS(100));
                 esp_restart();
             }
         } else {
+            if (held_ms > 0) {
+                ESP_LOGI(TAG, "Reset button released (held %d ms, threshold %d)",
+                         held_ms, BUTTON_HOLD_MS);
+            }
             held_ms = 0;
         }
         vTaskDelay(pdMS_TO_TICKS(50));
