@@ -134,6 +134,7 @@ typedef enum {
     ANIM_CONNECTING     = 1,   // 3 blue pulses while connecting
     ANIM_MOON           = 2,   // normal moon render
     ANIM_CONNECT_FAILED = 3,   // 4 quick red pulses before we wipe creds + reboot to AP
+    ANIM_PREVIEW        = 4,   // /debug Preview Cycle — RGB+W color-picked moon-phase loop
 } anim_mode_t;
 
 static volatile anim_mode_t s_anim_mode = ANIM_BOOT;
@@ -174,6 +175,14 @@ static float p_power_cap     = DEFAULT_POWER_CAP;
 // ── Manual override ────────────────────────────────────────
 static bool  manual_mode  = false;
 static float manual_phase = 0.0f;
+
+// ── Preview cycle (runtime only; not persisted) ────────────
+static volatile uint8_t s_preview_r       = 0xFF;
+static volatile uint8_t s_preview_g       = 0xFF;
+static volatile uint8_t s_preview_b       = 0xFF;
+static volatile float   s_preview_rgb_dim = 0.50f;
+static volatile float   s_preview_w_dim   = 0.50f;
+static volatile float   s_preview_speed   = 1.0f;   // 1× = BOOT_ANIM_CYCLE_SEC per loop
 
 // ──────────────────────────────────────────────────────────
 // NVS — render params
@@ -422,6 +431,20 @@ static void compute_moon_frame(float phase, float time_f, float breath_t)
     float fade = ft * ft * (3.0f - 2.0f * ft);     // smoothstep(0,1,lit_fraction)
     float face_grad_eff = p_face_gradient * (1.0f - fade);
 
+    // Edge fade: kill the soft terminator + edge-glimmer multiplier as we
+    // approach full moon. Both are anchored to lit_center, and at high
+    // lit_fraction the gradient zone covers ~half the ring — so as
+    // lit_center swings 90° → 270° during the flip, the whole pattern
+    // visibly rotated. Window 0.55 → 0.85 means the edge has fully faded
+    // before the flip window opens (phase 0.46–0.54 → lit_fraction 0.88+).
+    float edge_fade = 1.0f;
+    if (lit_fraction > 0.55f) {
+        float et = (lit_fraction - 0.55f) / 0.30f;
+        if (et > 1.0f) et = 1.0f;
+        float es = et * et * (3.0f - 2.0f * et);
+        edge_fade = 1.0f - es;
+    }
+
     // Global breath modulation. Amplitude scales with lit_fraction so it's
     // imperceptible at crescent phases but provides quiet life at full.
     // Period ~6 s.
@@ -449,9 +472,13 @@ static void compute_moon_frame(float phase, float time_f, float breath_t)
         } else if (dist > gradient_deg) {
             brightness = 0.0f;
         } else {
-            float t        = dist / gradient_deg;
-            brightness     = 0.5f - 0.5f * sinf(t * ((float)M_PI / 2.0f));
-            edge_proximity = 1.0f - fabsf(t);
+            float t      = dist / gradient_deg;
+            float soft_b = 0.5f - 0.5f * sinf(t * ((float)M_PI / 2.0f));
+            // Blend the soft terminator toward fully-lit as edge_fade → 0,
+            // so the rotation that would otherwise appear during the
+            // lit_center flip becomes invisible.
+            brightness     = edge_fade * soft_b + (1.0f - edge_fade);
+            edge_proximity = edge_fade * (1.0f - fabsf(t));
         }
 
         if (p_glimmer_on && brightness > 0.01f)
@@ -524,7 +551,8 @@ static void compute_boot_frame(float boot_phase)
             brightness = 0.5f - 0.5f * sinf(t * ((float)M_PI / 2.0f));
         }
 
-        brightness *= BOOT_ANIM_DIM;
+        // No BOOT_ANIM_DIM here — caller scales (ANIM_BOOT applies it; the
+        // preview animation uses its own RGB/W brightness sliders).
         if (brightness < 0.0f) brightness = 0.0f;
         if (brightness > 1.0f) brightness = 1.0f;
         frame_b[i] = brightness;
@@ -543,6 +571,45 @@ static void output_white(void)
         out[i][1] = 0;
         out[i][2] = 0;
         out[i][3] = (uint8_t)(frame_b[i] * cap * 255.0f);
+    }
+    bool changed = !last_out_valid ||
+                   memcmp(out, last_out, sizeof(out)) != 0;
+    if (!changed) return;
+
+    xSemaphoreTake(led_mutex, portMAX_DELAY);
+    for (int i = 0; i < LED_COUNT; i++) {
+        led_strip_set_pixel_rgbw(s_strip, i,
+            out[i][0], out[i][1], out[i][2], out[i][3]);
+    }
+    led_strip_refresh(s_strip);
+    xSemaphoreGive(led_mutex);
+    memcpy(last_out, out, sizeof(out));
+    last_out_valid = true;
+}
+
+// Drive all four channels for the preview cycle. R/G/B come from the color
+// picker scaled by the RGB-brightness slider; W is driven independently by
+// its own slider so you can mix the picked color with warm white at any
+// ratio. p_power_cap is still applied as the hard current ceiling.
+static void output_preview(void)
+{
+    float cap = p_power_cap;
+    if (cap < 0.0f) cap = 0.0f;
+    if (cap > 1.0f) cap = 1.0f;
+
+    float rgb_dim = s_preview_rgb_dim;
+    float w_dim   = s_preview_w_dim;
+    float pr      = (float)s_preview_r * (1.0f / 255.0f);
+    float pg      = (float)s_preview_g * (1.0f / 255.0f);
+    float pb      = (float)s_preview_b * (1.0f / 255.0f);
+
+    uint8_t out[LED_COUNT][4];
+    for (int i = 0; i < LED_COUNT; i++) {
+        float b = frame_b[i] * cap;
+        out[i][0] = (uint8_t)(b * rgb_dim * pr * 255.0f);
+        out[i][1] = (uint8_t)(b * rgb_dim * pg * 255.0f);
+        out[i][2] = (uint8_t)(b * rgb_dim * pb * 255.0f);
+        out[i][3] = (uint8_t)(b * w_dim   * 255.0f);
     }
     bool changed = !last_out_valid ||
                    memcmp(out, last_out, sizeof(out)) != 0;
@@ -648,10 +715,20 @@ static void render_task(void *arg)
         switch (mode) {
         case ANIM_BOOT: {
             // Dedicated boot renderer — smooth sin² sweep, no debug params.
-            // BOOT_ANIM_DIM is applied inside compute_boot_frame.
             compute_boot_frame(boot_phase);
+            for (int i = 0; i < LED_COUNT; i++) frame_b[i] *= BOOT_ANIM_DIM;
             output_blue();
             boot_phase = fmodf(boot_phase + boot_dphase, 1.0f);
+            break;
+        }
+        case ANIM_PREVIEW: {
+            // Same smooth sweep as boot, but full-range frame_b (caller
+            // controls RGB and W brightness via output_preview).
+            compute_boot_frame(boot_phase);
+            output_preview();
+            // Speed multiplier lets the user drag from 0.25× (long, calm
+            // cycle) to 10× (fast color demo).
+            boot_phase = fmodf(boot_phase + boot_dphase * s_preview_speed, 1.0f);
             break;
         }
         case ANIM_CONNECTING: {
@@ -1069,15 +1146,32 @@ static const char *DEBUG_PAGE =
 "</div>"
 "<div class='controls' id='glimmer-controls'>"
 "<label>Body shimmer<span id='lbl-gbase'></span></label>"
-"<input type='range' id='s-gbase' min='0' max='500' oninput='onParam()'/>"
-"<div class='note'>Subtle brightness wobble across the lit face.</div>"
+"<input type='range' id='s-gbase' min='0' max='1000' oninput='onParam()'/>"
+"<div class='note'>Brightness wobble across the lit face. Past 0.500 the pixels go fully dark at troughs (blink, not wobble).</div>"
 "<label>Edge shimmer<span id='lbl-gedge'></span></label>"
-"<input type='range' id='s-gedge' min='0' max='1000' oninput='onParam()'/>"
-"<div class='note'>Extra wobble near the terminator. May reintroduce flicker if data line is noisy.</div>"
+"<input type='range' id='s-gedge' min='0' max='2000' oninput='onParam()'/>"
+"<div class='note'>Extra wobble near the terminator. Past 1.000 the edges fully blink. May reintroduce flicker if data line is noisy.</div>"
 "<label>Speed<span id='lbl-gspeed'></span></label>"
-"<input type='range' id='s-gspeed' min='50' max='2000' oninput='onParam()'/>"
+"<input type='range' id='s-gspeed' min='50' max='4000' oninput='onParam()'/>"
 "<div class='note'>How fast the shimmer oscillates.</div>"
 "</div>"
+"<hr/>"
+"<div class='section-title'>Preview Cycle</div>"
+"<div class='mode-row'>"
+"<button class='mode-btn active' id='btn-prev-stop' onclick='setPreview(false)'>Stop</button>"
+"<button class='mode-btn' id='btn-prev-play' onclick='setPreview(true)'>Play</button>"
+"</div>"
+"<label>Color<span id='lbl-prev-color'>#ffffff</span></label>"
+"<input type='color' id='prev-color' value='#ffffff' oninput='onPreviewParam()'/>"
+"<label>RGB brightness<span id='lbl-prev-rgb'></span></label>"
+"<input type='range' id='s-prev-rgb' min='0' max='1000' oninput='onPreviewParam()'/>"
+"<label>White brightness<span id='lbl-prev-w'></span></label>"
+"<input type='range' id='s-prev-w' min='0' max='1000' oninput='onPreviewParam()'/>"
+"<label>Speed<span id='lbl-prev-speed'></span></label>"
+"<input type='range' id='s-prev-speed' min='25' max='1000' oninput='onPreviewParam()'/>"
+"<div class='slider-labels'><span>0.25x</span><span>1x</span><span>10x</span></div>"
+"<div class='note'>Runs a smooth moon-phase cycle in your picked color. Drive RGB only, W only, or mix.</div>"
+"<hr/>"
 "<button class='save-btn' onclick='saveParams()'>Save to Device</button>"
 "<div class='saved-msg' id='saved-msg'>Saved.</div>"
 "<div class='status' id='status'>—</div>"
@@ -1100,6 +1194,22 @@ static const char *DEBUG_PAGE =
 "var url=p<0?'/debug/set?mode=real':'/debug/set?mode=manual&phase='+p.toFixed(4);"
 "fetch(url).catch(function(){});},60);"
 "var sendParamsTh=makeThrottle(function(q){fetch(q).catch(function(){});},80);"
+"var sendPreviewTh=makeThrottle(function(q){fetch(q).catch(function(){});},80);"
+"function setPreview(on){"
+"document.getElementById('btn-prev-stop').classList.toggle('active',!on);"
+"document.getElementById('btn-prev-play').classList.toggle('active',on);"
+"fetch('/debug/preview?on='+(on?'1':'0')).catch(function(){});}"
+"function onPreviewParam(){"
+"var color=document.getElementById('prev-color').value.substring(1);"
+"var rgb=document.getElementById('s-prev-rgb').value/1000.0;"
+"var w=document.getElementById('s-prev-w').value/1000.0;"
+"var speed=document.getElementById('s-prev-speed').value/100.0;"
+"document.getElementById('lbl-prev-color').textContent='#'+color;"
+"document.getElementById('lbl-prev-rgb').textContent=rgb.toFixed(3);"
+"document.getElementById('lbl-prev-w').textContent=w.toFixed(3);"
+"document.getElementById('lbl-prev-speed').textContent=speed.toFixed(2)+'x';"
+"sendPreviewTh('/debug/preview?color='+color+'&rgb='+rgb.toFixed(3)"
+"+'&w='+w.toFixed(3)+'&speed='+speed.toFixed(3));}"
 "function phaseName(p){"
 "var ill=0.5-0.5*Math.cos(p*2*Math.PI);"
 "if(ill<0.02)return'New Moon';"
@@ -1202,6 +1312,16 @@ static const char *DEBUG_PAGE =
 "document.getElementById('lbl-gbase').textContent=d.gbase.toFixed(3);"
 "document.getElementById('lbl-gedge').textContent=d.gedge.toFixed(3);"
 "document.getElementById('lbl-gspeed').textContent=d.gspeed.toFixed(3);"
+"document.getElementById('btn-prev-stop').classList.toggle('active',!d.prev_on);"
+"document.getElementById('btn-prev-play').classList.toggle('active',d.prev_on);"
+"document.getElementById('prev-color').value='#'+d.prev_color;"
+"document.getElementById('lbl-prev-color').textContent='#'+d.prev_color;"
+"document.getElementById('s-prev-rgb').value=Math.round(d.prev_rgb*1000);"
+"document.getElementById('s-prev-w').value=Math.round(d.prev_w*1000);"
+"document.getElementById('s-prev-speed').value=Math.round(d.prev_speed*100);"
+"document.getElementById('lbl-prev-rgb').textContent=d.prev_rgb.toFixed(3);"
+"document.getElementById('lbl-prev-w').textContent=d.prev_w.toFixed(3);"
+"document.getElementById('lbl-prev-speed').textContent=d.prev_speed.toFixed(2)+'x';"
 "}).catch(function(){});}"
 "poll();setInterval(poll,5000);"
 "</script></body></html>";
@@ -1456,19 +1576,24 @@ static esp_err_t handle_status(httpd_req_t *req)
     if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK)
         snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
 
-    char buf[512];
+    char buf[768];
     snprintf(buf, sizeof(buf),
         "{\"phase\":%.4f,\"illumination\":%.1f,\"name\":\"%s\","
         "\"manual\":%s,\"ip\":\"%s\","
         "\"q1\":%.3f,\"g1\":%.3f,\"g3\":%.3f,\"q3\":%.3f,"
         "\"bright\":%.3f,\"grad\":%.3f,\"floor\":%.3f,\"pcap\":%.3f,"
-        "\"gon\":%s,\"gbase\":%.3f,\"gedge\":%.3f,\"gspeed\":%.3f}",
+        "\"gon\":%s,\"gbase\":%.3f,\"gedge\":%.3f,\"gspeed\":%.3f,"
+        "\"prev_on\":%s,\"prev_color\":\"%02x%02x%02x\","
+        "\"prev_rgb\":%.3f,\"prev_w\":%.3f,\"prev_speed\":%.3f}",
         phase, ill * 100.0f, phase_name(phase),
         manual_mode ? "true" : "false", ip_str,
         p_curve_q1, p_curve_g1, p_curve_g3, p_curve_q3,
         p_brightness, p_face_gradient, p_floor, p_power_cap,
         p_glimmer_on ? "true" : "false",
-        p_glimmer_base, p_glimmer_edge, p_glimmer_speed);
+        p_glimmer_base, p_glimmer_edge, p_glimmer_speed,
+        (s_anim_mode == ANIM_PREVIEW) ? "true" : "false",
+        s_preview_r, s_preview_g, s_preview_b,
+        s_preview_rgb_dim, s_preview_w_dim, s_preview_speed);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, strlen(buf));
@@ -1540,6 +1665,61 @@ static esp_err_t handle_params_save(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Preview cycle controls. Runtime state only — does not persist in NVS.
+//   on=0|1                turn the preview loop on/off
+//   color=RRGGBB          6-hex-digit color (no leading #)
+//   rgb=0..1              brightness of the RGB channels
+//   w=0..1                brightness of the W channel
+//   speed=0.05..20        cycle-rate multiplier (1× = ~25 s/cycle)
+static esp_err_t handle_preview(httpd_req_t *req)
+{
+    if (!req_is_authed(req)) {
+        return send_redirect(req, "/debug/login", NULL);
+    }
+    char query[256] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[16];
+        if (httpd_query_key_value(query, "on", val, sizeof(val)) == ESP_OK) {
+            bool want_on = (strcmp(val, "1") == 0);
+            if (want_on) {
+                s_anim_mode = ANIM_PREVIEW;
+            } else if (s_anim_mode == ANIM_PREVIEW) {
+                s_anim_mode = ANIM_MOON;
+            }
+        }
+        if (httpd_query_key_value(query, "color", val, sizeof(val)) == ESP_OK) {
+            if (strlen(val) == 6) {
+                char rs[3] = { val[0], val[1], 0 };
+                char gs[3] = { val[2], val[3], 0 };
+                char bs[3] = { val[4], val[5], 0 };
+                s_preview_r = (uint8_t)strtol(rs, NULL, 16);
+                s_preview_g = (uint8_t)strtol(gs, NULL, 16);
+                s_preview_b = (uint8_t)strtol(bs, NULL, 16);
+            }
+        }
+        if (httpd_query_key_value(query, "rgb", val, sizeof(val)) == ESP_OK) {
+            float v = strtof(val, NULL);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            s_preview_rgb_dim = v;
+        }
+        if (httpd_query_key_value(query, "w", val, sizeof(val)) == ESP_OK) {
+            float v = strtof(val, NULL);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            s_preview_w_dim = v;
+        }
+        if (httpd_query_key_value(query, "speed", val, sizeof(val)) == ESP_OK) {
+            float v = strtof(val, NULL);
+            if (v < 0.05f) v = 0.05f;
+            if (v > 20.0f) v = 20.0f;
+            s_preview_speed = v;
+        }
+    }
+    httpd_resp_send(req, "ok", 2);
+    return ESP_OK;
+}
+
 // ──────────────────────────────────────────────────────────
 // HTTP — server bring-up
 // ──────────────────────────────────────────────────────────
@@ -1556,6 +1736,7 @@ static void register_debug_routes(httpd_handle_t server)
         { .uri="/debug/set",        .method=HTTP_GET,  .handler=handle_set          },
         { .uri="/debug/params",     .method=HTTP_GET,  .handler=handle_params       },
         { .uri="/debug/params/save",.method=HTTP_GET,  .handler=handle_params_save  },
+        { .uri="/debug/preview",    .method=HTTP_GET,  .handler=handle_preview      },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++)
         httpd_register_uri_handler(server, &routes[i]);
