@@ -530,6 +530,18 @@ static void compute_boot_frame(float boot_phase)
     float fade = ill * ill * (3.0f - 2.0f * ill);
     float face_grad_eff = BOOT_FACE_GRADIENT * (1.0f - fade);
 
+    // Edge fade — kill the soft terminator as the sweep approaches its peak.
+    // Without this the gradient zone (which covers ~half the ring at high
+    // illumination) visibly rotates with lit_center during the flip.
+    // Mirrors the same logic in compute_moon_frame.
+    float edge_fade = 1.0f;
+    if (ill > 0.55f) {
+        float et = (ill - 0.55f) / 0.30f;
+        if (et > 1.0f) et = 1.0f;
+        float es = et * et * (3.0f - 2.0f * et);
+        edge_fade = 1.0f - es;
+    }
+
     for (int i = 0; i < LED_COUNT; i++) {
         float angle = led_angle_lut[i];
         float rel   = angle - lit_center;
@@ -548,8 +560,9 @@ static void compute_boot_frame(float boot_phase)
         } else if (dist > gradient_deg) {
             brightness = 0.0f;
         } else {
-            float t = dist / gradient_deg;
-            brightness = 0.5f - 0.5f * sinf(t * ((float)M_PI / 2.0f));
+            float t      = dist / gradient_deg;
+            float soft_b = 0.5f - 0.5f * sinf(t * ((float)M_PI / 2.0f));
+            brightness   = edge_fade * soft_b + (1.0f - edge_fade);
         }
 
         // No BOOT_ANIM_DIM here — caller scales (ANIM_BOOT applies it; the
@@ -1184,7 +1197,7 @@ static const char *DEBUG_PAGE =
 "<button class='mode-btn' id='btn-prev-play' onclick='setPreview(true)'>Play</button>"
 "</div>"
 "<label>Color<span id='lbl-prev-color'>#ffffff</span></label>"
-"<input type='color' id='prev-color' value='#ffffff' oninput='onPreviewParam()'/>"
+"<input type='color' id='prev-color' value='#ffffff' oninput='onPreviewParam()' onchange='onPreviewParam()'/>"
 "<label>RGB brightness<span id='lbl-prev-rgb'></span></label>"
 "<input type='range' id='s-prev-rgb' min='0' max='1000' oninput='onPreviewParam()'/>"
 "<label>White brightness<span id='lbl-prev-w'></span></label>"
