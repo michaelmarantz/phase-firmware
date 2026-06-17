@@ -81,13 +81,13 @@
 
 // ── Rendering defaults ─────────────────────────────────────
 #define GRADIENT_WIDTH         0.28f
-#define DEFAULT_FACE_GRADIENT  0.45f
+#define DEFAULT_FACE_GRADIENT  0.0f    // no body-gradient by default
 #define DEFAULT_BRIGHTNESS     1.0f
-#define DEFAULT_FLOOR          0.15f
-#define DEFAULT_GLIMMER_ON     false
-#define DEFAULT_GLIMMER_BASE   0.10f
-#define DEFAULT_GLIMMER_EDGE   0.30f
-#define DEFAULT_GLIMMER_SPEED  0.30f
+#define DEFAULT_FLOOR          0.0f    // no brightness floor by default
+#define DEFAULT_GLIMMER_ON     true    // glimmer is the new normal
+#define DEFAULT_GLIMMER_BASE   0.04f   // tuned for the 138-pixel ring
+#define DEFAULT_GLIMMER_EDGE   1.36f
+#define DEFAULT_GLIMMER_SPEED  2.60f
 #define DEFAULT_CURVE_Q1       0.259f
 #define DEFAULT_CURVE_G1       0.501f
 #define DEFAULT_CURVE_G3       0.500f
@@ -107,6 +107,7 @@
 #define FAILED_PULSE_DIM       0.70f
 #define FAILED_PULSE_COUNT     4
 #define WIFI_CONNECT_TIMEOUT_MS  60000 // give up after 60 s of failed connects
+#define MOON_FADE_IN_SEC       2.0f    // smoothstep ramp when entering ANIM_MOON
 
 // ── Logging tag ────────────────────────────────────────────
 #define TAG "phase"
@@ -699,6 +700,7 @@ static void render_task(void *arg)
     float boot_phase  = 0.0f;
     float pulse_t     = 0.0f;
     int   pulse_count = 0;
+    float moon_fade_t = 0.0f;   // 0..1 ramp when entering ANIM_MOON
     anim_mode_t prev_mode = (anim_mode_t)-1;
 
     while (1) {
@@ -709,6 +711,7 @@ static void render_task(void *arg)
             last_out_valid = false;
             pulse_t = 0.0f;
             pulse_count = 0;
+            moon_fade_t = 0.0f;  // restart the 2 s fade-in on every entry into MOON
             prev_mode = mode;
         }
 
@@ -732,7 +735,15 @@ static void render_task(void *arg)
             break;
         }
         case ANIM_CONNECTING: {
-            // Peak at CONNECTING_PULSE_DIM, stop after CONNECTING_PULSE_COUNT pulses.
+            if (pulse_count >= CONNECTING_PULSE_COUNT) {
+                // Pulses done — hold the strip dark while app_main finishes
+                // mDNS + SNTP setup. ANIM_MOON's own fade-in then ramps the
+                // moon up smoothly from black, so the user sees a clean
+                // "pulses → dark hold → moon fade-in" transition.
+                for (int i = 0; i < LED_COUNT; i++) frame_b[i] = 0.0f;
+                output_blue();
+                break;
+            }
             float bright = CONNECTING_PULSE_DIM *
                            (0.5f - 0.5f * cosf(pulse_t * 2.0f * (float)M_PI));
             for (int i = 0; i < LED_COUNT; i++) frame_b[i] = bright;
@@ -766,8 +777,15 @@ static void render_task(void *arg)
         }
         case ANIM_MOON:
         default: {
+            // 2 s smoothstep fade-in any time we enter MOON mode (cold
+            // start after pulses, or returning from preview).
+            moon_fade_t += frame_sec / MOON_FADE_IN_SEC;
+            if (moon_fade_t > 1.0f) moon_fade_t = 1.0f;
+            float mf = moon_fade_t * moon_fade_t * (3.0f - 2.0f * moon_fade_t);
+
             float phase = manual_mode ? manual_phase : calc_moon_phase();
             compute_moon_frame(phase, time_f, breath_t);
+            for (int i = 0; i < LED_COUNT; i++) frame_b[i] *= mf;
             output_white();
             break;
         }
@@ -1017,6 +1035,10 @@ static esp_err_t send_redirect(httpd_req_t *req, const char *location, const cha
 "color:#e8e0d0;font-family:inherit;font-size:11px;letter-spacing:.25em;" \
 "text-transform:uppercase;cursor:pointer;border-radius:2px;margin-top:4px;transition:all .2s}" \
 ".save-btn:hover,.primary-btn:hover{background:#e8e0d0;color:#0a0a0a}" \
+".danger-btn{width:100%;padding:13px;border:1px solid #6a3030;background:transparent;" \
+"color:#c66;font-family:inherit;font-size:11px;letter-spacing:.25em;" \
+"text-transform:uppercase;cursor:pointer;border-radius:2px;margin-top:4px;transition:all .2s}" \
+".danger-btn:hover{background:#6a3030;color:#f8e8e8}" \
 ".status{font-size:10px;color:#333;text-align:center;letter-spacing:.1em;margin-top:16px}" \
 ".saved-msg{color:#888;font-size:10px;text-align:center;margin-top:12px;" \
 "letter-spacing:.15em;opacity:0;transition:opacity .5s}" \
@@ -1174,6 +1196,10 @@ static const char *DEBUG_PAGE =
 "<hr/>"
 "<button class='save-btn' onclick='saveParams()'>Save to Device</button>"
 "<div class='saved-msg' id='saved-msg'>Saved.</div>"
+"<hr/>"
+"<div class='section-title'>Network</div>"
+"<button class='danger-btn' onclick='resetWifi()'>Reset to AP Mode</button>"
+"<div class='note'>Wipes the saved Wi-Fi credentials and reboots the device. \"phase\" AP will appear so you can re-provision. Render parameters are kept.</div>"
 "<div class='status' id='status'>—</div>"
 "<div class='status'>firmware " FW_VERSION "</div>"
 "</div>"
@@ -1283,6 +1309,9 @@ static const char *DEBUG_PAGE =
 "m.style.opacity=1;"
 "setTimeout(function(){m.style.opacity=0;},2000);"
 "}).catch(function(){});}"
+"function resetWifi(){"
+"if(!confirm('Wipe saved Wi-Fi credentials and reboot into AP mode?'))return;"
+"fetch('/debug/reset_wifi').catch(function(){});}"
 "function poll(){"
 "fetch('/debug/status').then(function(r){return r.json();})"
 ".then(function(d){"
@@ -1665,6 +1694,21 @@ static esp_err_t handle_params_save(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Manually trigger an AP-mode reset from the debug portal — same end state
+// as holding the physical reset button for 3 s.
+static esp_err_t handle_reset_wifi(httpd_req_t *req)
+{
+    if (!req_is_authed(req)) {
+        return send_redirect(req, "/debug/login", NULL);
+    }
+    ESP_LOGW(TAG, "Reset to AP mode requested via /debug — clearing creds + rebooting");
+    httpd_resp_send(req, "ok", 2);
+    vTaskDelay(pdMS_TO_TICKS(150));  // let the response flush
+    clear_wifi_creds();
+    esp_restart();
+    return ESP_OK;
+}
+
 // Preview cycle controls. Runtime state only — does not persist in NVS.
 //   on=0|1                turn the preview loop on/off
 //   color=RRGGBB          6-hex-digit color (no leading #)
@@ -1737,6 +1781,7 @@ static void register_debug_routes(httpd_handle_t server)
         { .uri="/debug/params",     .method=HTTP_GET,  .handler=handle_params       },
         { .uri="/debug/params/save",.method=HTTP_GET,  .handler=handle_params_save  },
         { .uri="/debug/preview",    .method=HTTP_GET,  .handler=handle_preview      },
+        { .uri="/debug/reset_wifi", .method=HTTP_GET,  .handler=handle_reset_wifi   },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++)
         httpd_register_uri_handler(server, &routes[i]);
