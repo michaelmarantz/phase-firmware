@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -108,6 +109,7 @@
 #define FAILED_PULSE_COUNT     4
 #define WIFI_CONNECT_TIMEOUT_MS  60000 // give up after 60 s of failed connects
 #define MOON_FADE_IN_SEC       2.0f    // smoothstep ramp when entering ANIM_MOON
+#define MODE_EXIT_FADE_SEC     0.4f    // fade-out applied to current mode when a switch is requested
 
 // ── Logging tag ────────────────────────────────────────────
 #define TAG "phase"
@@ -141,9 +143,10 @@ typedef enum {
 static volatile anim_mode_t s_anim_mode = ANIM_BOOT;
 
 static EventGroupHandle_t s_events;
-#define EV_GOT_IP            BIT0
-#define EV_CONNECTING_DONE   BIT1
-#define EV_FAILED_DONE       BIT2
+#define EV_GOT_IP                 BIT0
+#define EV_CONNECTING_DONE        BIT1
+#define EV_FAILED_DONE            BIT2
+#define EV_STANDALONE_REQUESTED   BIT3
 
 // Mutex serialising led_strip_refresh() against any flash-touching code
 // (NVS commit, scan, restart prep). Flash ops disable the CPU cache, which
@@ -705,34 +708,53 @@ static void output_blue(void)
 static void render_task(void *arg)
 {
     (void)arg;
-    const float frame_sec    = (float)RENDER_PERIOD_MS / 1000.0f;
-    const float boot_dphase  = frame_sec / BOOT_ANIM_CYCLE_SEC;        // phase units per frame
-    const float pulse_dt     = frame_sec * CONNECTING_PULSE_HZ;        // 0..1 per pulse cycle
+    const float frame_sec      = (float)RENDER_PERIOD_MS / 1000.0f;
+    const float boot_dphase    = frame_sec / BOOT_ANIM_CYCLE_SEC;        // phase units per frame
+    const float pulse_dt       = frame_sec * CONNECTING_PULSE_HZ;        // 0..1 per pulse cycle
+    const float exit_fade_rate = frame_sec / MODE_EXIT_FADE_SEC;
     float time_f      = 0.0f;
     float breath_t    = 0.0f;   // real-time seconds — independent of glimmer speed
     float boot_phase  = 0.0f;
     float pulse_t     = 0.0f;
     int   pulse_count = 0;
     float moon_fade_t = 0.0f;   // 0..1 ramp when entering ANIM_MOON
-    anim_mode_t prev_mode = (anim_mode_t)-1;
+    float exit_fade   = 0.0f;   // 0..1, ramps up when active_mode ≠ requested
+    anim_mode_t active_mode = (anim_mode_t)-1;
 
     while (1) {
-        anim_mode_t mode = s_anim_mode;
-        if (mode != prev_mode) {
-            // Force a redraw on mode change since the frame buffer hasn't
-            // necessarily changed.
-            last_out_valid = false;
-            pulse_t = 0.0f;
-            pulse_count = 0;
-            moon_fade_t = 0.0f;  // restart the 2 s fade-in on every entry into MOON
-            prev_mode = mode;
+        anim_mode_t requested = s_anim_mode;
+
+        if (active_mode == (anim_mode_t)-1) {
+            // First tick — adopt whatever's requested without fading anything.
+            active_mode = requested;
         }
 
-        switch (mode) {
+        // Universal mode transition: when a new mode is requested, fade the
+        // active mode out over MODE_EXIT_FADE_SEC, then swap. This makes
+        // BOOT → CONNECTING, BOOT → MOON (standalone), MOON ↔ PREVIEW, etc.
+        // all read as one smooth gesture instead of a hard cut.
+        if (requested != active_mode) {
+            exit_fade += exit_fade_rate;
+            if (exit_fade >= 1.0f) {
+                active_mode    = requested;
+                exit_fade      = 0.0f;
+                last_out_valid = false;
+                pulse_t        = 0.0f;
+                pulse_count    = 0;
+                moon_fade_t    = 0.0f;
+            }
+        } else if (exit_fade > 0.0f) {
+            // Edge case: requested flipped back to active mid-fade — heal it.
+            exit_fade = 0.0f;
+        }
+
+        float exit_mul = 1.0f - exit_fade;
+
+        switch (active_mode) {
         case ANIM_BOOT: {
             // Dedicated boot renderer — smooth sin² sweep, no debug params.
             compute_boot_frame(boot_phase);
-            for (int i = 0; i < LED_COUNT; i++) frame_b[i] *= BOOT_ANIM_DIM;
+            for (int i = 0; i < LED_COUNT; i++) frame_b[i] *= BOOT_ANIM_DIM * exit_mul;
             output_blue();
             boot_phase = fmodf(boot_phase + boot_dphase, 1.0f);
             break;
@@ -741,6 +763,7 @@ static void render_task(void *arg)
             // Same smooth sweep as boot, but full-range frame_b (caller
             // controls RGB and W brightness via output_preview).
             compute_boot_frame(boot_phase);
+            for (int i = 0; i < LED_COUNT; i++) frame_b[i] *= exit_mul;
             output_preview();
             // Speed multiplier lets the user drag from 0.25× (long, calm
             // cycle) to 10× (fast color demo).
@@ -751,15 +774,14 @@ static void render_task(void *arg)
             if (pulse_count >= CONNECTING_PULSE_COUNT) {
                 // Pulses done — hold the strip dark while app_main finishes
                 // mDNS + SNTP setup. ANIM_MOON's own fade-in then ramps the
-                // moon up smoothly from black, so the user sees a clean
-                // "pulses → dark hold → moon fade-in" transition.
+                // moon up smoothly from black.
                 for (int i = 0; i < LED_COUNT; i++) frame_b[i] = 0.0f;
                 output_blue();
                 break;
             }
             float bright = CONNECTING_PULSE_DIM *
                            (0.5f - 0.5f * cosf(pulse_t * 2.0f * (float)M_PI));
-            for (int i = 0; i < LED_COUNT; i++) frame_b[i] = bright;
+            for (int i = 0; i < LED_COUNT; i++) frame_b[i] = bright * exit_mul;
             output_blue();
             pulse_t += pulse_dt;
             if (pulse_t >= 1.0f) {
@@ -776,7 +798,7 @@ static void render_task(void *arg)
             // we wipe creds and reboot into AP mode.
             float bright = FAILED_PULSE_DIM *
                            (0.5f - 0.5f * cosf(pulse_t * 2.0f * (float)M_PI));
-            for (int i = 0; i < LED_COUNT; i++) frame_b[i] = bright;
+            for (int i = 0; i < LED_COUNT; i++) frame_b[i] = bright * exit_mul;
             output_red();
             pulse_t += frame_sec * FAILED_PULSE_HZ;
             if (pulse_t >= 1.0f) {
@@ -791,14 +813,14 @@ static void render_task(void *arg)
         case ANIM_MOON:
         default: {
             // 2 s smoothstep fade-in any time we enter MOON mode (cold
-            // start after pulses, or returning from preview).
+            // start after pulses, return from preview, or after standalone).
             moon_fade_t += frame_sec / MOON_FADE_IN_SEC;
             if (moon_fade_t > 1.0f) moon_fade_t = 1.0f;
             float mf = moon_fade_t * moon_fade_t * (3.0f - 2.0f * moon_fade_t);
 
             float phase = manual_mode ? manual_phase : calc_moon_phase();
             compute_moon_frame(phase, time_f, breath_t);
-            for (int i = 0; i < LED_COUNT; i++) frame_b[i] *= mf;
+            for (int i = 0; i < LED_COUNT; i++) frame_b[i] *= mf * exit_mul;
             output_white();
             break;
         }
@@ -1075,9 +1097,18 @@ static const char *SETUP_PAGE =
 "<input type='password' name='pass' autocomplete='off'/>"
 "<button class='primary-btn' type='submit'>Connect</button>"
 "</form>"
+"<hr/>"
+"<div class='section-title'>or, run without Wi-Fi</div>"
+"<form method='POST' action='/setup_standalone'>"
+"<label>Today's date<span></span></label>"
+"<input type='date' name='date' id='date-today' required/>"
+"<button class='primary-btn' type='submit'>Start Standalone</button>"
+"</form>"
+"<div class='note'>For venues without Wi-Fi. Phase will display the moon for the date you enter — no internet needed. The \"phase\" AP stays on so you can still reach /debug.</div>"
 "<div class='status'>firmware " FW_VERSION "</div>"
 "</div>"
 "<script>"
+"document.getElementById('date-today').value=new Date().toISOString().substring(0,10);"
 "fetch('/scan').then(function(r){return r.json();}).then(function(j){"
 "var s=document.getElementById('ssid');s.innerHTML='';"
 "if(!j.networks||!j.networks.length){var o=document.createElement('option');"
@@ -1522,6 +1553,71 @@ static esp_err_t handle_setup_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Standalone mode: take a date from the user (when there's no Wi-Fi
+// available), set the system clock to noon UTC on that date, and signal
+// app_main to drop straight into ANIM_MOON. The AP stays up so /debug is
+// still reachable. Session-only — does not persist across reboots.
+static esp_err_t handle_setup_standalone(httpd_req_t *req)
+{
+    char body[256];
+    int n = read_post_body(req, body, sizeof(body));
+    if (n <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "no body", 7);
+        return ESP_OK;
+    }
+    char date_str[16] = {0};
+    if (!form_get(body, "date", date_str, sizeof(date_str)) || strlen(date_str) < 8) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "missing date", 12);
+        return ESP_OK;
+    }
+    int y = 0, m = 0, d = 0;
+    if (sscanf(date_str, "%d-%d-%d", &y, &m, &d) != 3 ||
+        y < 1970 || y > 2100 || m < 1 || m > 12 || d < 1 || d > 31) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "bad date format (want YYYY-MM-DD)", 34);
+        return ESP_OK;
+    }
+
+    // Force UTC interpretation so mktime() doesn't pull in whatever TZ the
+    // chip thinks it's in.
+    setenv("TZ", "UTC0", 1);
+    tzset();
+    struct tm tm = {0};
+    tm.tm_year = y - 1900;
+    tm.tm_mon  = m - 1;
+    tm.tm_mday = d;
+    tm.tm_hour = 12;
+    time_t epoch = mktime(&tm);
+    if (epoch == (time_t)-1) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "bad date", 8);
+        return ESP_OK;
+    }
+    struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    ESP_LOGI(TAG, "Standalone: clock set to %04d-%02d-%02d 12:00 UTC — entering ANIM_MOON",
+             y, m, d);
+
+    xEventGroupSetBits(s_events, EV_STANDALONE_REQUESTED);
+
+    const char *ok_html =
+        "<!DOCTYPE html><html><head><meta name='viewport' "
+        "content='width=device-width, initial-scale=1'>"
+        "<style>" PHASE_STYLE "</style></head><body><div class='card'>"
+        "<h1>Lunar Objects &mdash; Phase</h1>"
+        "<div class='phase-display'>"
+        "<div class='phase-name'>Standalone.</div>"
+        "<div class='phase-pct'>moon is now showing for your date</div>"
+        "</div>"
+        "<div class='note' style='margin-top:24px'>The \"phase\" Wi-Fi network is still up so you can reach /debug to tune. Reboot to return to setup.</div>"
+        "</div></body></html>";
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, ok_html, strlen(ok_html));
+    return ESP_OK;
+}
+
 // ──────────────────────────────────────────────────────────
 // HTTP — handlers (STA mode + debug portal)
 // ──────────────────────────────────────────────────────────
@@ -1829,9 +1925,10 @@ static void start_webserver_ap(void)
         return;
     }
     httpd_uri_t ap_routes[] = {
-        { .uri="/",      .method=HTTP_GET,  .handler=handle_setup_root },
-        { .uri="/scan",  .method=HTTP_GET,  .handler=handle_scan       },
-        { .uri="/setup", .method=HTTP_POST, .handler=handle_setup_post },
+        { .uri="/",                 .method=HTTP_GET,  .handler=handle_setup_root       },
+        { .uri="/scan",             .method=HTTP_GET,  .handler=handle_scan             },
+        { .uri="/setup",            .method=HTTP_POST, .handler=handle_setup_post       },
+        { .uri="/setup_standalone", .method=HTTP_POST, .handler=handle_setup_standalone },
     };
     for (size_t i = 0; i < sizeof(ap_routes) / sizeof(ap_routes[0]); i++)
         httpd_register_uri_handler(server, &ap_routes[i]);
@@ -1896,9 +1993,15 @@ void app_main(void)
         wifi_init_ap();
         mdns_setup();
         start_webserver_ap();
-        // Park here forever; the /setup POST handler triggers esp_restart()
-        // once the user has saved credentials.
-        vTaskDelay(portMAX_DELAY);
+        // Two exits:
+        //   /setup       → save creds + esp_restart() (this thread never returns)
+        //   /setup_standalone → set system clock + signal EV_STANDALONE_REQUESTED
+        // The standalone path drops into ANIM_MOON right here, leaving the AP
+        // running so /debug stays reachable.
+        xEventGroupWaitBits(s_events, EV_STANDALONE_REQUESTED,
+                            true, true, portMAX_DELAY);
+        ESP_LOGI(TAG, "Standalone mode active — moon now rendering against user-supplied date.");
+        s_anim_mode = ANIM_MOON;
         return;
     }
 
