@@ -1,13 +1,17 @@
-# Phase — 2 MB flash, OTA-capable layout (edition00.1)
+# Phase — 4 MB flash, OTA-capable layout (edition00.2)
 #
-# nvs and phy_init keep the exact offset/size of the previous single-app
+# nvs and phy_init keep the exact offset/size of the original single-app
 # table, so Wi-Fi creds + render params survive the first serial reflash
-# onto this layout. otadata + two 960 KB app slots fill the rest of the
-# 2 MB chip exactly. App slots must start on 0x10000 boundaries.
+# onto this layout. otadata + two 1.9375 MB app slots fill the 4 MB chip.
+# App slots must start on 0x10000 boundaries.
 #
-# Name,     Type, SubType, Offset,   Size
-nvs,        data, nvs,     0x9000,   0x6000
-phy_init,   data, phy,     0xf000,   0x1000
-otadata,    data, ota,     0x10000,  0x2000
-ota_0,      app,  ota_0,   0x20000,  0xF0000
-ota_1,      app,  ota_1,   0x110000, 0xF0000
+# Slot size (0x1F0000 = 2 031 616 bytes) leaves plenty of headroom over
+# the current ~1 MB binary — no need to trim WPA3/IPv6/enterprise-Wi-Fi
+# to fit, unlike the 2 MB layout.
+#
+# Name,     Type, SubType, Offset,    Size
+nvs,        data, nvs,     0x9000,    0x6000
+phy_init,   data, phy,     0xf000,    0x1000
+otadata,    data, ota,     0x10000,   0x2000
+ota_0,      app,  ota_0,   0x20000,   0x1F0000
+ota_1,      app,  ota_1,   0x210000,  0x1F0000

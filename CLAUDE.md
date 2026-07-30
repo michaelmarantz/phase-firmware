@@ -1,10 +1,10 @@
 # phase-firmware
 
-ESP-IDF firmware for the Phase lamp — an ESP32-C3 driving a ring of addressable LEDs that renders the current moon phase, with a web UI for live tuning. Branch `edition00` is a substantial rework: SK6812 RGBW strip, captive-portal Wi-Fi provisioning, reset button, mDNS, and an auth-gated debug portal. Branch `edition00.1` adds silent automatic OTA updates — see "OTA updates" below.
+ESP-IDF firmware for the Phase lamp — an ESP32-C3 driving a ring of addressable LEDs that renders the current moon phase, with a web UI for live tuning. Branch `edition00` is a substantial rework: SK6812 RGBW strip, captive-portal Wi-Fi provisioning, reset button, mDNS, and an auth-gated debug portal. Branch `edition00.1` adds silent automatic OTA updates — see "OTA updates" below. Branch `edition00.2` moves to the 4 MB flash the chip actually has (partition slots resized), and restores the WPA3-SAE / IPv6 / WPA2-Enterprise support that had to be trimmed to fit the 2 MB OTA layout.
 
 ## Hardware (edition00)
 
-- **MCU:** ESP32-C3 (RISC-V, single-core, 2 MB flash)
+- **MCU:** ESP32-C3 (RISC-V, single-core, 4 MB flash — the SPI chip was always 4 MB, we just told ESP-IDF "2 MB" through edition00.1 by mistake)
 - **LEDs:** 138× **SK6812 RGBW** on **GPIO 8**, GRBW byte order, driven via RMT at 10 MHz
 - LED 0 sits at **12 o'clock**; indices advance clockwise (`led_angle(i) = i * 360 / 138`)
 - **Color:** W channel only for moon rendering (R=G=B=0); B channel used for boot AP + Wi-Fi-connecting animations
@@ -24,12 +24,17 @@ Previous revisions: `prototype-02.x` = 52× WS2812 on GPIO 2; `prototype-04` = 9
 
 The fleet follows the **latest GitHub release** of this repo. Each STA-connected lamp checks `https://github.com/michaelmarantz/phase-firmware/releases/latest/download/phase.bin` ~30 s after boot and every 6 h, compares the image's app-descriptor version to its own, and on any difference downloads into the spare OTA slot and reboots. Fully silent — no user consent step anywhere.
 
-- **Publish an update:** bump `FW_VERSION`, commit, run `./release.sh` (builds, size-checks against the 960 KB slot, tags, `gh release create` with `phase.bin`). Repo/releases must stay publicly downloadable.
-- **Partition table** is custom (`partitions.csv`): `nvs` + `phy_init` keep their old offsets (creds/params survive the first serial reflash), then `otadata` + two 960 KB `ota_0`/`ota_1` slots fill the 2 MB chip exactly.
+- **Publish an update:** bump `FW_VERSION`, commit, run `./release.sh` (builds, size-checks against the OTA slot, tags, `gh release create` with `phase.bin`). Repo/releases must stay publicly downloadable.
+- **Partition table** is custom (`partitions.csv`). On edition00.2 the layout is `nvs` + `phy_init` at their original offsets (creds/params survive the first serial reflash from any prior single-app build), then `otadata` + two **1.9375 MB** `ota_0`/`ota_1` slots fill the 4 MB chip. Roughly 2× the headroom of the edition00.1 layout — the sdkconfig no longer has to trim features to fit.
 - **Rollback:** `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`. A fresh OTA image boots as `PENDING_VERIFY`; `ota_mark_boot_valid()` confirms it only after the device reaches a healthy steady state (webserver up). A crash-looping release rolls back to the previous slot on its own.
 - **Glitch discipline:** every `esp_https_ota_perform()` chunk holds `led_mutex` (flash writes vs. RMT — same rule as NVS commits). Expect the render to breathe slightly during a download; that's by design.
 - **Testing/debug:** `/debug` has a "Check for Update Now" button (`/debug/ota_check`), and `/debug/status` reports `fw`, `ota`, `ota_msg`, `ota_pct`. NVS key `ota_url` (namespace `phase`) overrides the update URL per device for bench testing.
-- **Compiler is now `-Os`** (was `-Og`) — required for the smaller OTA slots. Standalone (no-Wi-Fi) lamps never update, by construction.
+- **Compiler is `-Os`** — kept from edition00.1. Standalone (no-Wi-Fi) lamps never update, by construction.
+- **What's re-enabled on edition00.2** (thanks to the roomier 4 MB partition):
+    * **WPA3-SAE** and WPA3-compatible mode — connects to WPA3-only routers.
+    * **IPv6** (LWIP full stack) — dual-stack home/office networks.
+    * **WPA2-Enterprise** (802.1X) — corporate / university networks.
+    * `ESP_ERR_TO_NAME_LOOKUP` — readable error strings in the serial log.
 
 ## Build & flash
 

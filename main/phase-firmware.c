@@ -76,7 +76,7 @@
 // FW_VERSION is the single source of truth: the top-level CMakeLists
 // extracts it into PROJECT_VER, which lands in the app descriptor that
 // OTA uses for is-this-new comparisons. Bump it for every release.
-#define FW_VERSION       "edition00.1"
+#define FW_VERSION       "edition00.2"
 #define AP_SSID          "phase"
 #define MDNS_HOSTNAME    "phase"
 #define MDNS_INSTANCE    "Lunar Objects — Phase"
