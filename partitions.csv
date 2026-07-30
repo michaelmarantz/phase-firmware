@@ -1,0 +1,13 @@
+# Phase — 2 MB flash, OTA-capable layout (edition00.1)
+#
+# nvs and phy_init keep the exact offset/size of the previous single-app
+# table, so Wi-Fi creds + render params survive the first serial reflash
+# onto this layout. otadata + two 960 KB app slots fill the rest of the
+# 2 MB chip exactly. App slots must start on 0x10000 boundaries.
+#
+# Name,     Type, SubType, Offset,   Size
+nvs,        data, nvs,     0x9000,   0x6000
+phy_init,   data, phy,     0xf000,   0x1000
+otadata,    data, ota,     0x10000,  0x2000
+ota_0,      app,  ota_0,   0x20000,  0xF0000
+ota_1,      app,  ota_1,   0x110000, 0xF0000

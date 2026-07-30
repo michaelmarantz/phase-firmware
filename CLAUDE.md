@@ -1,6 +1,6 @@
 # phase-firmware
 
-ESP-IDF firmware for the Phase lamp — an ESP32-C3 driving a ring of addressable LEDs that renders the current moon phase, with a web UI for live tuning. Branch `edition00` is a substantial rework: SK6812 RGBW strip, captive-portal Wi-Fi provisioning, reset button, mDNS, and an auth-gated debug portal.
+ESP-IDF firmware for the Phase lamp — an ESP32-C3 driving a ring of addressable LEDs that renders the current moon phase, with a web UI for live tuning. Branch `edition00` is a substantial rework: SK6812 RGBW strip, captive-portal Wi-Fi provisioning, reset button, mDNS, and an auth-gated debug portal. Branch `edition00.1` adds silent automatic OTA updates — see "OTA updates" below.
 
 ## Hardware (edition00)
 
@@ -18,6 +18,18 @@ Previous revisions: `prototype-02.x` = 52× WS2812 on GPIO 2; `prototype-04` = 9
 
 - **CMake project name** is `phase-prototype` — stays constant across hardware revisions. Build artifact: `build/phase-prototype.bin`.
 - **Branch name** identifies the hardware revision / edition (`prototype-02.1`, `prototype-04`, `edition00`, …). `FW_VERSION` in `main/phase-firmware.c` should match the branch.
+- **`FW_VERSION` is the OTA trigger.** The top-level CMakeLists extracts it into `PROJECT_VER`, which lands in the app descriptor; deployed lamps compare it against the published binary's descriptor and update on any difference. Bump it for every release — publishing with an unchanged version is a fleet-wide no-op.
+
+## OTA updates (edition00.1+)
+
+The fleet follows the **latest GitHub release** of this repo. Each STA-connected lamp checks `https://github.com/michaelmarantz/phase-firmware/releases/latest/download/phase.bin` ~30 s after boot and every 6 h, compares the image's app-descriptor version to its own, and on any difference downloads into the spare OTA slot and reboots. Fully silent — no user consent step anywhere.
+
+- **Publish an update:** bump `FW_VERSION`, commit, run `./release.sh` (builds, size-checks against the 960 KB slot, tags, `gh release create` with `phase.bin`). Repo/releases must stay publicly downloadable.
+- **Partition table** is custom (`partitions.csv`): `nvs` + `phy_init` keep their old offsets (creds/params survive the first serial reflash), then `otadata` + two 960 KB `ota_0`/`ota_1` slots fill the 2 MB chip exactly.
+- **Rollback:** `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`. A fresh OTA image boots as `PENDING_VERIFY`; `ota_mark_boot_valid()` confirms it only after the device reaches a healthy steady state (webserver up). A crash-looping release rolls back to the previous slot on its own.
+- **Glitch discipline:** every `esp_https_ota_perform()` chunk holds `led_mutex` (flash writes vs. RMT — same rule as NVS commits). Expect the render to breathe slightly during a download; that's by design.
+- **Testing/debug:** `/debug` has a "Check for Update Now" button (`/debug/ota_check`), and `/debug/status` reports `fw`, `ota`, `ota_msg`, `ota_pct`. NVS key `ota_url` (namespace `phase`) overrides the update URL per device for bench testing.
+- **Compiler is now `-Os`** (was `-Og`) — required for the smaller OTA slots. Standalone (no-Wi-Fi) lamps never update, by construction.
 
 ## Build & flash
 
@@ -86,7 +98,7 @@ Single file (~1100 lines). Sections:
 ## Notes / gotchas
 
 - `glimmer_offset[]` / `glimmer_rate[]` / `frame_b[]` / `last_out[]` are sized at compile time from `LED_COUNT`. Bump `LED_COUNT` and they resize for free.
-- App partition is 1 MB; the edition00 binary uses **~94%** (vs. 87% on prototype-02.x). Adding more features will need either size optimization (`-Os` is already on) or a custom partition table.
+- App partitions are now the two 960 KB OTA slots; the edition00.1 binary lands at ~966 KB with **~16 KB headroom**. `release.sh` refuses to publish a binary that doesn't fit. Getting HTTPS-OTA to fit took: app `-Os` (was `-Og`), cert bundle → common-CA subset, mbedTLS TLS-client-only + no renegotiation + no error strings, Wi-Fi enterprise off, **WPA3-SAE off** (WPA3-only networks can't be joined — transition-mode routers still fine), IPv6 off, exotic ECC curves off (P-256/P-384/25519 kept), silent asserts, no esp_err_to_name tables. Next levers if a future build creeps over: serve the /debug HTML gzipped (~18 KB), or drop default log level to WARN (~20 KB).
 - Debug portal creds (`DEBUG_USER` / `DEBUG_PASS`) and Wi-Fi creds are stored in NVS — they survive flash-app updates but are wiped by `idf.py erase-flash`.
 - Reset button bug-class: if you ever wire GPIO 9 (BOOT button) here by accident, you'll hold the chip in download mode. GPIO 20 is correct on this revision.
 

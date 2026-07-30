@@ -53,6 +53,11 @@
 #include "driver/gpio.h"
 #include "mdns.h"
 #include "led_strip.h"
+#include "esp_ota_ops.h"
+#include "esp_app_desc.h"
+#include "esp_https_ota.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 
 // ── Hardware ───────────────────────────────────────────────
 // LED_GPIO was originally 21, but on the v1 phase board the GPIO 21 trace
@@ -68,7 +73,10 @@
 #define LED_RMT_RES_HZ   10000000
 
 // ── Identity ───────────────────────────────────────────────
-#define FW_VERSION       "edition00"
+// FW_VERSION is the single source of truth: the top-level CMakeLists
+// extracts it into PROJECT_VER, which lands in the app descriptor that
+// OTA uses for is-this-new comparisons. Bump it for every release.
+#define FW_VERSION       "edition00.1"
 #define AP_SSID          "phase"
 #define MDNS_HOSTNAME    "phase"
 #define MDNS_INSTANCE    "Lunar Objects — Phase"
@@ -79,6 +87,20 @@
 // ── Debug portal credentials ───────────────────────────────
 #define DEBUG_USER       "REDACTED_DEBUG_USER"
 #define DEBUG_PASS       "REDACTED_DEBUG_PASS"
+
+// ── OTA (automatic over-the-air updates) ───────────────────
+// Every connected lamp silently polls OTA_DEFAULT_URL. The URL is a
+// GitHub "latest release" asset link, so it always points at the newest
+// published phase.bin without the device needing to talk to the GitHub
+// API. If the image at the URL reports a different app-descriptor
+// version than the running firmware, the lamp downloads it into the
+// spare OTA slot and reboots into it. The URL can be overridden per
+// device via NVS key "ota_url" (namespace "phase") for testing against
+// a local server.
+#define OTA_DEFAULT_URL        "https://github.com/michaelmarantz/phase-firmware/releases/latest/download/phase.bin"
+#define OTA_FIRST_CHECK_DELAY_MS  (30 * 1000)          // settle after boot
+#define OTA_CHECK_INTERVAL_MS     (6 * 60 * 60 * 1000) // then every 6 h
+#define OTA_HTTP_TIMEOUT_MS       (15 * 1000)
 
 // ── Rendering defaults ─────────────────────────────────────
 #define GRADIENT_WIDTH         0.28f
@@ -147,6 +169,20 @@ static EventGroupHandle_t s_events;
 #define EV_CONNECTING_DONE        BIT1
 #define EV_FAILED_DONE            BIT2
 #define EV_STANDALONE_REQUESTED   BIT3
+#define EV_OTA_CHECK_NOW          BIT4   // /debug "Check for Update" button
+
+// ── OTA state (read by /debug/status, written by ota_task) ─
+typedef enum {
+    OTA_IDLE        = 0,   // between checks
+    OTA_CHECKING    = 1,   // fetching image header
+    OTA_DOWNLOADING = 2,   // pulling the new image into the spare slot
+    OTA_REBOOTING   = 3,   // update verified, restart imminent
+} ota_state_t;
+
+static volatile ota_state_t s_ota_state       = OTA_IDLE;
+static volatile int         s_ota_progress    = 0;      // 0..100 while downloading
+static char                 s_ota_last[96]    = "not yet checked";
+static volatile time_t      s_ota_last_check  = 0;
 
 // Mutex serialising led_strip_refresh() against any flash-touching code
 // (NVS commit, scan, restart prep). Flash ops disable the CPU cache, which
@@ -989,6 +1025,171 @@ static void time_sync(void)
 }
 
 // ──────────────────────────────────────────────────────────
+// OTA — automatic over-the-air updates
+// ──────────────────────────────────────────────────────────
+//
+// Model: "the fleet follows the latest GitHub release." ota_task wakes
+// on boot (+30 s) and every 6 h, downloads the image header from the
+// release URL, and compares its app-descriptor version against the
+// running one. Different version → full download into the spare OTA
+// slot → reboot. No user interaction anywhere.
+//
+// Safety:
+//  - Rollback: CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE marks each fresh
+//    OTA image PENDING_VERIFY; we only mark it valid once the lamp
+//    reaches a healthy steady state (webserver up). If the new image
+//    crashes before that, the bootloader falls back to the old slot.
+//  - LED glitches: flash writes disable the CPU cache, which can stall
+//    the RMT refill ISR mid-frame (see glitch-fix notes). Every
+//    esp_https_ota_perform() chunk therefore holds led_mutex, same as
+//    NVS commits. The render loop just pauses a beat between chunks.
+
+// Read the effective update URL: NVS override ("ota_url") or default.
+static void ota_get_url(char *out, size_t out_sz)
+{
+    nvs_handle_t h;
+    if (nvs_open("phase", NVS_READONLY, &h) == ESP_OK) {
+        size_t len = out_sz;
+        if (nvs_get_str(h, "ota_url", out, &len) == ESP_OK && len > 1) {
+            nvs_close(h);
+            return;
+        }
+        nvs_close(h);
+    }
+    strlcpy(out, OTA_DEFAULT_URL, out_sz);
+}
+
+static void ota_set_last(const char *msg)
+{
+    strlcpy(s_ota_last, msg, sizeof(s_ota_last));
+    ESP_LOGI(TAG, "OTA: %s", s_ota_last);
+}
+
+// If this boot is the first on a fresh OTA image, declare it healthy so
+// the bootloader stops considering a rollback. Called once the device
+// has reached a functional steady state.
+static void ota_mark_boot_valid(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t st;
+    if (esp_ota_get_state_partition(running, &st) == ESP_OK &&
+        st == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGI(TAG, "OTA: new image confirmed healthy — rollback cancelled.");
+    }
+}
+
+// One full check-and-maybe-update pass. Returns only if no update was
+// applied (success ends in esp_restart()).
+static void ota_check_and_update(void)
+{
+    char url[256];
+    ota_get_url(url, sizeof(url));
+
+    s_ota_state = OTA_CHECKING;
+    s_ota_progress = 0;
+    time((time_t *)&s_ota_last_check);
+
+    esp_http_client_config_t http_cfg = {
+        .url = url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = OTA_HTTP_TIMEOUT_MS,
+        .keep_alive_enable = true,
+        // GitHub redirects the release asset to a long signed URL
+        // (~1.5 KB) — both buffers must hold it or the redirect fails.
+        .buffer_size = 4096,
+        .buffer_size_tx = 2560,
+    };
+    esp_https_ota_config_t ota_cfg = {
+        .http_config = &http_cfg,
+    };
+
+    esp_https_ota_handle_t handle = NULL;
+    esp_err_t err = esp_https_ota_begin(&ota_cfg, &handle);
+    if (err != ESP_OK) {
+        ota_set_last("check failed: can't reach update server");
+        s_ota_state = OTA_IDLE;
+        return;
+    }
+
+    // Peek at the new image's app descriptor before committing to a
+    // full download.
+    esp_app_desc_t new_app;
+    err = esp_https_ota_get_img_desc(handle, &new_app);
+    if (err != ESP_OK) {
+        ota_set_last("check failed: bad image header");
+        esp_https_ota_abort(handle);
+        s_ota_state = OTA_IDLE;
+        return;
+    }
+
+    const esp_app_desc_t *cur_app = esp_app_get_description();
+    if (strncmp(new_app.version, cur_app->version, sizeof(new_app.version)) == 0) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "up to date (%s)", cur_app->version);
+        ota_set_last(msg);
+        esp_https_ota_abort(handle);
+        s_ota_state = OTA_IDLE;
+        return;
+    }
+
+    ESP_LOGI(TAG, "OTA: new firmware \"%s\" available (running \"%s\") — updating.",
+             new_app.version, cur_app->version);
+    s_ota_state = OTA_DOWNLOADING;
+    int total = esp_https_ota_get_image_size(handle);
+
+    while (true) {
+        // Hold led_mutex per chunk: TLS recv + flash write happen inside
+        // perform(), and the flash write must not race led_strip_refresh().
+        xSemaphoreTake(led_mutex, portMAX_DELAY);
+        err = esp_https_ota_perform(handle);
+        xSemaphoreGive(led_mutex);
+        if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) break;
+        if (total > 0) {
+            s_ota_progress = 100 * esp_https_ota_get_image_len_read(handle) / total;
+        }
+        // Give render/httpd air between chunks.
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    if (err != ESP_OK || !esp_https_ota_is_complete_data_received(handle)) {
+        ota_set_last("download failed — will retry next cycle");
+        esp_https_ota_abort(handle);
+        s_ota_state = OTA_IDLE;
+        return;
+    }
+
+    err = esp_https_ota_finish(handle);   // validates image + sets boot slot
+    if (err != ESP_OK) {
+        ota_set_last(err == ESP_ERR_OTA_VALIDATE_FAILED
+                         ? "image validation failed"
+                         : "update finalize failed");
+        s_ota_state = OTA_IDLE;
+        return;
+    }
+
+    char msg[96];
+    snprintf(msg, sizeof(msg), "updated to %s — rebooting", new_app.version);
+    ota_set_last(msg);
+    s_ota_state = OTA_REBOOTING;
+    s_ota_progress = 100;
+    vTaskDelay(pdMS_TO_TICKS(1500));      // let /debug/status show the result
+    esp_restart();
+}
+
+static void ota_task(void *arg)
+{
+    // First check shortly after boot, then on a slow cycle; the /debug
+    // "Check for Update" button can force a pass at any time.
+    TickType_t wait = pdMS_TO_TICKS(OTA_FIRST_CHECK_DELAY_MS);
+    while (true) {
+        xEventGroupWaitBits(s_events, EV_OTA_CHECK_NOW, true, true, wait);
+        ota_check_and_update();
+        wait = pdMS_TO_TICKS(OTA_CHECK_INTERVAL_MS);
+    }
+}
+
+// ──────────────────────────────────────────────────────────
 // HTTP — session auth helpers
 // ──────────────────────────────────────────────────────────
 
@@ -1244,6 +1445,11 @@ static const char *DEBUG_PAGE =
 "<div class='section-title'>Network</div>"
 "<button class='danger-btn' onclick='resetWifi()'>Reset to AP Mode</button>"
 "<div class='note'>Wipes the saved Wi-Fi credentials and reboots the device. \"phase\" AP will appear so you can re-provision. Render parameters are kept.</div>"
+"<hr/>"
+"<div class='section-title'>Firmware</div>"
+"<button class='save-btn' onclick='checkOta()'>Check for Update Now</button>"
+"<div class='note'>Updates are automatic — the lamp checks for a new release shortly after boot and every 6 hours, then installs and reboots on its own. This button just skips the wait.</div>"
+"<div class='status' id='ota-status'>—</div>"
 "<div class='status' id='status'>—</div>"
 "<div class='status'>firmware " FW_VERSION "</div>"
 "</div>"
@@ -1356,6 +1562,7 @@ static const char *DEBUG_PAGE =
 "function resetWifi(){"
 "if(!confirm('Wipe saved Wi-Fi credentials and reboot into AP mode?'))return;"
 "fetch('/debug/reset_wifi').catch(function(){});}"
+"function checkOta(){fetch('/debug/ota_check').catch(function(){});}"
 "function poll(){"
 "fetch('/debug/status').then(function(r){return r.json();})"
 ".then(function(d){"
@@ -1395,6 +1602,11 @@ static const char *DEBUG_PAGE =
 "document.getElementById('lbl-prev-rgb').textContent=d.prev_rgb.toFixed(3);"
 "document.getElementById('lbl-prev-w').textContent=d.prev_w.toFixed(3);"
 "document.getElementById('lbl-prev-speed').textContent=d.prev_speed.toFixed(2)+'x';"
+"var o=d.ota_msg;"
+"if(d.ota==='downloading')o='downloading… '+d.ota_pct+'%';"
+"else if(d.ota==='checking')o='checking…';"
+"else if(d.ota==='rebooting')o='update installed — rebooting';"
+"document.getElementById('ota-status').textContent='update: '+o;"
 "}).catch(function(){});}"
 "poll();setInterval(poll,5000);"
 "</script></body></html>";
@@ -1714,7 +1926,11 @@ static esp_err_t handle_status(httpd_req_t *req)
     if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK)
         snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
 
-    char buf[768];
+    static const char *ota_state_names[] = {
+        "idle", "checking", "downloading", "rebooting"
+    };
+
+    char buf[1024];
     snprintf(buf, sizeof(buf),
         "{\"phase\":%.4f,\"illumination\":%.1f,\"name\":\"%s\","
         "\"manual\":%s,\"ip\":\"%s\","
@@ -1722,7 +1938,8 @@ static esp_err_t handle_status(httpd_req_t *req)
         "\"bright\":%.3f,\"grad\":%.3f,\"floor\":%.3f,\"pcap\":%.3f,"
         "\"gon\":%s,\"gbase\":%.3f,\"gedge\":%.3f,\"gspeed\":%.3f,"
         "\"prev_on\":%s,\"prev_color\":\"%02x%02x%02x\","
-        "\"prev_rgb\":%.3f,\"prev_w\":%.3f,\"prev_speed\":%.3f}",
+        "\"prev_rgb\":%.3f,\"prev_w\":%.3f,\"prev_speed\":%.3f,"
+        "\"fw\":\"%s\",\"ota\":\"%s\",\"ota_msg\":\"%s\",\"ota_pct\":%d}",
         phase, ill * 100.0f, phase_name(phase),
         manual_mode ? "true" : "false", ip_str,
         p_curve_q1, p_curve_g1, p_curve_g3, p_curve_q3,
@@ -1731,7 +1948,9 @@ static esp_err_t handle_status(httpd_req_t *req)
         p_glimmer_base, p_glimmer_edge, p_glimmer_speed,
         (s_anim_mode == ANIM_PREVIEW) ? "true" : "false",
         s_preview_r, s_preview_g, s_preview_b,
-        s_preview_rgb_dim, s_preview_w_dim, s_preview_speed);
+        s_preview_rgb_dim, s_preview_w_dim, s_preview_speed,
+        FW_VERSION, ota_state_names[s_ota_state], s_ota_last,
+        s_ota_progress);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, strlen(buf));
@@ -1818,6 +2037,19 @@ static esp_err_t handle_reset_wifi(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Nudge ota_task to run a check-and-update pass right now instead of
+// waiting for the next 6-hour cycle. Purely a convenience for testing —
+// the automatic cycle needs no interaction.
+static esp_err_t handle_ota_check(httpd_req_t *req)
+{
+    if (!req_is_authed(req)) {
+        return send_redirect(req, "/debug/login", NULL);
+    }
+    xEventGroupSetBits(s_events, EV_OTA_CHECK_NOW);
+    httpd_resp_send(req, "ok", 2);
+    return ESP_OK;
+}
+
 // Preview cycle controls. Runtime state only — does not persist in NVS.
 //   on=0|1                turn the preview loop on/off
 //   color=RRGGBB          6-hex-digit color (no leading #)
@@ -1891,6 +2123,7 @@ static void register_debug_routes(httpd_handle_t server)
         { .uri="/debug/params/save",.method=HTTP_GET,  .handler=handle_params_save  },
         { .uri="/debug/preview",    .method=HTTP_GET,  .handler=handle_preview      },
         { .uri="/debug/reset_wifi", .method=HTTP_GET,  .handler=handle_reset_wifi   },
+        { .uri="/debug/ota_check",  .method=HTTP_GET,  .handler=handle_ota_check    },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++)
         httpd_register_uri_handler(server, &routes[i]);
@@ -1899,7 +2132,7 @@ static void register_debug_routes(httpd_handle_t server)
 static void start_webserver_sta(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 20;
     // Recycle oldest socket when the table fills, so a slider flood can't
     // wedge the server against the connection limit.
     config.lru_purge_enable = true;
@@ -1915,7 +2148,7 @@ static void start_webserver_sta(void)
 static void start_webserver_ap(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 20;
     // Recycle oldest socket when the table fills, so a slider flood can't
     // wedge the server against the connection limit.
     config.lru_purge_enable = true;
@@ -1998,6 +2231,9 @@ void app_main(void)
         //   /setup_standalone → set system clock + signal EV_STANDALONE_REQUESTED
         // The standalone path drops into ANIM_MOON right here, leaving the AP
         // running so /debug stays reachable.
+        // Device is functional (AP + webserver up) — if this is a fresh
+        // OTA image, it survived far enough to count as healthy.
+        ota_mark_boot_valid();
         xEventGroupWaitBits(s_events, EV_STANDALONE_REQUESTED,
                             true, true, portMAX_DELAY);
         ESP_LOGI(TAG, "Standalone mode active — moon now rendering against user-supplied date.");
@@ -2033,6 +2269,12 @@ void app_main(void)
     mdns_setup();
     start_webserver_sta();
     time_sync();
+
+    // Healthy steady state reached — confirm a fresh OTA image so the
+    // bootloader stops considering a rollback, then start the silent
+    // auto-update cycle. Stack is generous because TLS runs in-task.
+    ota_mark_boot_valid();
+    xTaskCreate(ota_task, "ota", 9216, NULL, tskIDLE_PRIORITY + 1, NULL);
 
     s_anim_mode = ANIM_MOON;
     float phase = calc_moon_phase();
