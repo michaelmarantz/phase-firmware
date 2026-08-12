@@ -1,6 +1,6 @@
 # phase-firmware
 
-ESP-IDF firmware for the Phase lamp — an ESP32-C3 driving a ring of addressable LEDs that renders the current moon phase, with a web UI for live tuning. Branch `edition00` is a substantial rework: SK6812 RGBW strip, captive-portal Wi-Fi provisioning, reset button, mDNS, and an auth-gated debug portal. Branch `edition00.1` adds silent automatic OTA updates — see "OTA updates" below. Branch `edition00.2` moves to the 4 MB flash the chip actually has (partition slots resized), and restores the WPA3-SAE / IPv6 / WPA2-Enterprise support that had to be trimmed to fit the 2 MB OTA layout.
+ESP-IDF firmware for the Phase lamp — an ESP32-C3 driving a ring of addressable LEDs that renders the current moon phase, with a web UI for live tuning. Branch `edition00` is a substantial rework: SK6812 RGBW strip, captive-portal Wi-Fi provisioning, reset button, mDNS, and an auth-gated debug portal. Branch `edition00.1` adds silent automatic OTA updates — see "OTA updates" below. Branch `edition00.2` moves to the 4 MB flash the chip actually has (partition slots resized), and restores the WPA3-SAE / IPv6 / WPA2-Enterprise support that had to be trimmed to fit the 2 MB OTA layout. Branch `edition00.3` adds per-device unique names — see "Device naming" below.
 
 ## Hardware (edition00)
 
@@ -19,6 +19,18 @@ Previous revisions: `prototype-02.x` = 52× WS2812 on GPIO 2; `prototype-04` = 9
 - **CMake project name** is `phase-prototype` — stays constant across hardware revisions. Build artifact: `build/phase-prototype.bin`.
 - **Branch name** identifies the hardware revision / edition (`prototype-02.1`, `prototype-04`, `edition00`, …). `FW_VERSION` in `main/phase-firmware.c` should match the branch.
 - **`FW_VERSION` is the OTA trigger.** The top-level CMakeLists extracts it into `PROJECT_VER`, which lands in the app descriptor; deployed lamps compare it against the published binary's descriptor and update on any difference. Bump it for every release — publishing with an unchanged version is a fleet-wide no-op.
+
+## Device naming (edition00.3+)
+
+Every lamp gets a unique name so multiple units can coexist on one network.
+
+- **Default (no config needed):** `phase-<mac6>` where `<mac6>` is the last 3 bytes of the STA MAC as 6 lowercase hex chars. E.g. `phase-a94290`. Deterministic per chip. Used as **both** the mDNS hostname AND the AP setup SSID.
+- **Friendly override:** the `/debug` page has a "Device Name" section with a text field. Set e.g. `e00-2-3`; from then on the lamp advertises as `phase-e00-2-3.local` and its setup AP SSID becomes `phase-e00-2-3`. Stored in NVS key `friendly` (namespace `phase`). Sanitized on input: lowercase, digits and hyphens only, spaces/underscores/dots collapse to `-`, leading/trailing hyphens trimmed, capped at 24 chars.
+- **Live update:** renaming updates the mDNS hostname immediately (via `mdns_hostname_set()` — no reboot). The AP SSID reflects the new name on the next AP-mode boot.
+- **Clear the friendly name** (revert to MAC form) by submitting an empty name in the field.
+- **Endpoints:** `GET /whoami` (open, both AP and STA — returns the current hostname as text) and `GET /debug/name?name=…` (auth-gated, sets/clears the friendly name).
+- Every page's `<h1>` shows the active hostname in brackets, and the browser tab title becomes the hostname — handy when three lamps are open in adjacent tabs.
+- Both `SETUP_PAGE` and `LOGIN_PAGE` fetch `/whoami` on load so you can always tell *which* lamp is asking for your Wi-Fi password / debug login.
 
 ## OTA updates (edition00.1+)
 

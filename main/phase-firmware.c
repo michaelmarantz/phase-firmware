@@ -76,9 +76,12 @@
 // FW_VERSION is the single source of truth: the top-level CMakeLists
 // extracts it into PROJECT_VER, which lands in the app descriptor that
 // OTA uses for is-this-new comparisons. Bump it for every release.
-#define FW_VERSION       "edition00.2"
-#define AP_SSID          "phase"
-#define MDNS_HOSTNAME    "phase"
+#define FW_VERSION       "edition00.3"
+// AP_SSID and MDNS_HOSTNAME are BOTH suffixed at runtime with the
+// device's unique tag: either its MAC-derived hex (default) or the
+// user's friendly name set via /debug. Final forms look like
+// "phase-a94290" (default) or "phase-e00-2-3" (friendly).
+#define NAME_PREFIX      "phase"
 #define MDNS_INSTANCE    "Lunar Objects — Phase"
 
 // ── Reset button ───────────────────────────────────────────
@@ -195,6 +198,13 @@ static led_strip_handle_t s_strip;
 
 // Random session token for /debug cookies. 32 hex chars + null.
 static char s_session_token[33];
+
+// Device naming — see NAME_PREFIX comment. `s_mac_suffix` is always set at
+// boot (6 hex chars from the STA MAC's last 3 bytes). `s_friendly_name` is
+// empty by default, populated from NVS if the user has renamed the lamp via
+// /debug. `device_tag()` returns whichever is currently in effect.
+static char s_mac_suffix[8];      // e.g. "a94290"
+static char s_friendly_name[32];  // "" = fall back to MAC suffix
 
 // ── Live params ────────────────────────────────────────────
 static float p_face_gradient = DEFAULT_FACE_GRADIENT;
@@ -318,6 +328,85 @@ static void clear_wifi_creds(void)
         nvs_close(h);
     }
     xSemaphoreGive(led_mutex);
+}
+
+// ──────────────────────────────────────────────────────────
+// Device naming (friendly + MAC-based fallback)
+// ──────────────────────────────────────────────────────────
+
+// Compute the 6-hex-char suffix from the last 3 bytes of the STA MAC.
+// Called once at boot before Wi-Fi is used.
+static void compute_mac_suffix(void)
+{
+    uint8_t mac[6] = {0};
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
+        strcpy(s_mac_suffix, "000000");
+        return;
+    }
+    snprintf(s_mac_suffix, sizeof(s_mac_suffix),
+             "%02x%02x%02x", mac[3], mac[4], mac[5]);
+}
+
+static void nvs_load_friendly_name(void)
+{
+    nvs_handle_t h;
+    s_friendly_name[0] = '\0';
+    if (nvs_open("phase", NVS_READONLY, &h) != ESP_OK) return;
+    size_t sz = sizeof(s_friendly_name);
+    if (nvs_get_str(h, "friendly", s_friendly_name, &sz) != ESP_OK) {
+        s_friendly_name[0] = '\0';
+    }
+    nvs_close(h);
+}
+
+static void nvs_save_friendly_name(const char *name)
+{
+    xSemaphoreTake(led_mutex, portMAX_DELAY);
+    nvs_handle_t h;
+    if (nvs_open("phase", NVS_READWRITE, &h) == ESP_OK) {
+        if (name && name[0]) {
+            nvs_set_str(h, "friendly", name);
+        } else {
+            nvs_erase_key(h, "friendly");
+        }
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    xSemaphoreGive(led_mutex);
+}
+
+// The tag that gets suffixed onto NAME_PREFIX for mDNS + AP SSID.
+// Friendly name wins if set, else the MAC hex.
+static const char *device_tag(void)
+{
+    return s_friendly_name[0] ? s_friendly_name : s_mac_suffix;
+}
+
+// "phase-{tag}" written to `out` (max out_sz including null).
+static void device_hostname(char *out, size_t out_sz)
+{
+    snprintf(out, out_sz, "%s-%s", NAME_PREFIX, device_tag());
+}
+
+// Force user input into an mDNS-safe label: lowercase, digits, hyphens.
+// Spaces/underscores collapse to '-'. Everything else stripped. Leading /
+// trailing hyphens trimmed. Cap at 24 chars (fits inside "phase-…" under
+// mDNS's 63-char single-label limit with lots of slack).
+static void sanitize_friendly(const char *in, char *out, size_t out_sz)
+{
+    size_t o = 0;
+    size_t cap = (out_sz > 25) ? 25 : out_sz;   // room for null
+    for (size_t i = 0; in[i] && o < cap - 1; i++) {
+        char c = in[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+            out[o++] = c;
+        } else if (c == ' ' || c == '_' || c == '.') {
+            if (o > 0 && out[o - 1] != '-') out[o++] = '-';
+        }
+    }
+    while (o > 0 && out[o - 1] == '-') o--;
+    out[o] = '\0';
 }
 
 // ──────────────────────────────────────────────────────────
@@ -920,10 +1009,24 @@ static void mdns_setup(void)
         ESP_LOGE(TAG, "mdns_init failed: %s", esp_err_to_name(err));
         return;
     }
-    mdns_hostname_set(MDNS_HOSTNAME);
+    char hostname[48];
+    device_hostname(hostname, sizeof(hostname));
+    mdns_hostname_set(hostname);
     mdns_instance_name_set(MDNS_INSTANCE);
     mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
-    ESP_LOGI(TAG, "mDNS up — http://%s.local/", MDNS_HOSTNAME);
+    ESP_LOGI(TAG, "mDNS up — http://%s.local/", hostname);
+}
+
+// Re-apply the mDNS hostname without a full mDNS restart. Called after the
+// user renames the lamp via /debug/name so `phase-<newname>.local` starts
+// working immediately, without waiting for the next reboot.
+static void mdns_refresh_hostname(void)
+{
+    char hostname[48];
+    device_hostname(hostname, sizeof(hostname));
+    if (mdns_hostname_set(hostname) == ESP_OK) {
+        ESP_LOGI(TAG, "mDNS hostname now http://%s.local/", hostname);
+    }
 }
 
 // ──────────────────────────────────────────────────────────
@@ -983,10 +1086,10 @@ static void wifi_init_ap(void)
     esp_wifi_init(&cfg);
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
 
+    char ap_ssid[33] = {0};
+    device_hostname(ap_ssid, sizeof(ap_ssid));   // "phase-<tag>"
     wifi_config_t ap_cfg = {
         .ap = {
-            .ssid            = AP_SSID,
-            .ssid_len        = (uint8_t)strlen(AP_SSID),
             .channel         = 6,
             .authmode        = WIFI_AUTH_OPEN,
             .max_connection  = 4,
@@ -996,12 +1099,14 @@ static void wifi_init_ap(void)
             .beacon_interval = 400,
         },
     };
+    strncpy((char *)ap_cfg.ap.ssid, ap_ssid, sizeof(ap_cfg.ap.ssid) - 1);
+    ap_cfg.ap.ssid_len = (uint8_t)strlen(ap_ssid);
 
     esp_wifi_set_mode(WIFI_MODE_APSTA);
     esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
     esp_wifi_start();
     esp_wifi_set_ps(WIFI_PS_NONE);
-    ESP_LOGI(TAG, "AP mode — SSID \"%s\" (open) — http://%s.local/", AP_SSID, MDNS_HOSTNAME);
+    ESP_LOGI(TAG, "AP mode — SSID \"%s\" (open) — http://%s.local/", ap_ssid, ap_ssid);
 }
 
 // ──────────────────────────────────────────────────────────
@@ -1286,7 +1391,7 @@ static const char *SETUP_PAGE =
 "<meta name='viewport' content='width=device-width, initial-scale=1'>"
 "<title>Phase — Setup</title>"
 "<style>" PHASE_STYLE "</style></head><body><div class='card'>"
-"<h1>Lunar Objects &mdash; Phase Setup</h1>"
+"<h1>Lunar Objects &mdash; Phase <span id='hdr-host' style='color:#e8e0d0;letter-spacing:.15em;text-transform:none'></span></h1>"
 "<div class='phase-display'>"
 "<div class='phase-name'>Hello.</div>"
 "<div class='phase-pct'>Pick your Wi-Fi network</div>"
@@ -1310,6 +1415,9 @@ static const char *SETUP_PAGE =
 "</div>"
 "<script>"
 "document.getElementById('date-today').value=new Date().toISOString().substring(0,10);"
+"fetch('/whoami').then(function(r){return r.text();}).then(function(h){"
+"document.getElementById('hdr-host').textContent='['+h+']';document.title='Setup — '+h;"
+"}).catch(function(){});"
 "fetch('/scan').then(function(r){return r.json();}).then(function(j){"
 "var s=document.getElementById('ssid');s.innerHTML='';"
 "if(!j.networks||!j.networks.length){var o=document.createElement('option');"
@@ -1342,11 +1450,14 @@ static const char *LOGIN_PAGE =
 "<meta name='viewport' content='width=device-width, initial-scale=1'>"
 "<title>Phase — Debug</title>"
 "<style>" PHASE_STYLE "</style></head><body><div class='card'>"
-"<h1>Lunar Objects &mdash; Debug</h1>"
+"<h1>Lunar Objects &mdash; Debug <span id='hdr-host' style='color:#e8e0d0;letter-spacing:.15em;text-transform:none'></span></h1>"
 "<div class='phase-display'>"
 "<div class='phase-name'>Locked.</div>"
 "<div class='phase-pct'>authenticate to continue</div>"
 "</div>"
+"<script>fetch('/whoami').then(function(r){return r.text();}).then(function(h){"
+"document.getElementById('hdr-host').textContent='['+h+']';document.title=h+' — login';"
+"}).catch(function(){});</script>"
 "<form method='POST' action='/debug/login'>"
 "<label>Username<span></span></label>"
 "<input type='text' name='user' autocomplete='username'/>"
@@ -1363,7 +1474,7 @@ static const char *DEBUG_PAGE =
 "<meta name='viewport' content='width=device-width, initial-scale=1'>"
 "<title>Phase</title>"
 "<style>" PHASE_STYLE "</style></head><body><div class='card'>"
-"<h1>Lunar Objects &mdash; Phase</h1>"
+"<h1>Lunar Objects &mdash; Phase <span id='hdr-host' style='color:#e8e0d0;letter-spacing:.15em;text-transform:none'></span></h1>"
 "<div class='phase-display'>"
 "<div class='phase-name' id='pname'>—</div>"
 "<div class='phase-pct' id='ppct'>—</div>"
@@ -1379,6 +1490,13 @@ static const char *DEBUG_PAGE =
 "<label>Pick a date</label>"
 "<input type='date' id='datepicker' onchange='onDate(this.value)'/>"
 "</div>"
+"<hr/>"
+"<div class='section-title'>Device Name</div>"
+"<label>Friendly name<span id='lbl-friendly'></span></label>"
+"<input type='text' id='fname' maxlength='24' placeholder='e.g. e00-2-3' autocapitalize='off' autocorrect='off' spellcheck='false'/>"
+"<button class='save-btn' onclick='saveName()'>Rename Lamp</button>"
+"<div class='saved-msg' id='name-saved'>Renamed.</div>"
+"<div class='note'>Both the <b>Wi-Fi setup SSID</b> and the <b>mDNS hostname</b> use this. Lowercase / digits / hyphens only. Leave empty to use the MAC-derived default (<code id='mac-tag'>—</code>). Multiple lamps on the same network need unique names.</div>"
 "<hr/>"
 "<div class='section-title'>Illumination Curve</div>"
 "<label>First quarter<span id='lbl-q1'></span></label>"
@@ -1563,6 +1681,16 @@ static const char *DEBUG_PAGE =
 "if(!confirm('Wipe saved Wi-Fi credentials and reboot into AP mode?'))return;"
 "fetch('/debug/reset_wifi').catch(function(){});}"
 "function checkOta(){fetch('/debug/ota_check').catch(function(){});}"
+"function saveName(){"
+"var n=document.getElementById('fname').value;"
+"fetch('/debug/name?name='+encodeURIComponent(n)).then(function(r){return r.text();})"
+".then(function(host){"
+"document.getElementById('hdr-host').textContent=host?('['+host+']'):'';"
+"var m=document.getElementById('name-saved');"
+"m.textContent=host?('Renamed to '+host):'Renamed.';m.style.opacity=1;"
+"setTimeout(function(){m.style.opacity=0;},2500);"
+"poll();"
+"}).catch(function(){});}"
 "function poll(){"
 "fetch('/debug/status').then(function(r){return r.json();})"
 ".then(function(d){"
@@ -1607,6 +1735,11 @@ static const char *DEBUG_PAGE =
 "else if(d.ota==='checking')o='checking…';"
 "else if(d.ota==='rebooting')o='update installed — rebooting';"
 "document.getElementById('ota-status').textContent='update: '+o;"
+"document.getElementById('hdr-host').textContent=d.host?('['+d.host+']'):'';"
+"document.title=d.host||'Phase';"
+"var f=document.getElementById('fname');"
+"if(document.activeElement!==f)f.value=d.friendly||'';"
+"document.getElementById('mac-tag').textContent='phase-'+d.mac_tag;"
 "}).catch(function(){});}"
 "poll();setInterval(poll,5000);"
 "</script></body></html>";
@@ -1674,6 +1807,17 @@ static int read_post_body(httpd_req_t *req, char *buf, size_t buf_sz)
 // ──────────────────────────────────────────────────────────
 // HTTP — handlers (AP mode)
 // ──────────────────────────────────────────────────────────
+
+// Open (no-auth) endpoint returning the current hostname (e.g. "phase-a94290")
+// so the setup page can display which lamp the client is talking to.
+static esp_err_t handle_name_get(httpd_req_t *req)
+{
+    char host[48];
+    device_hostname(host, sizeof(host));
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, host, strlen(host));
+    return ESP_OK;
+}
 
 static esp_err_t handle_setup_root(httpd_req_t *req)
 {
@@ -1930,10 +2074,14 @@ static esp_err_t handle_status(httpd_req_t *req)
         "idle", "checking", "downloading", "rebooting"
     };
 
+    char host[48];
+    device_hostname(host, sizeof(host));
+
     char buf[1024];
     snprintf(buf, sizeof(buf),
         "{\"phase\":%.4f,\"illumination\":%.1f,\"name\":\"%s\","
         "\"manual\":%s,\"ip\":\"%s\","
+        "\"host\":\"%s\",\"friendly\":\"%s\",\"mac_tag\":\"%s\","
         "\"q1\":%.3f,\"g1\":%.3f,\"g3\":%.3f,\"q3\":%.3f,"
         "\"bright\":%.3f,\"grad\":%.3f,\"floor\":%.3f,\"pcap\":%.3f,"
         "\"gon\":%s,\"gbase\":%.3f,\"gedge\":%.3f,\"gspeed\":%.3f,"
@@ -1942,6 +2090,7 @@ static esp_err_t handle_status(httpd_req_t *req)
         "\"fw\":\"%s\",\"ota\":\"%s\",\"ota_msg\":\"%s\",\"ota_pct\":%d}",
         phase, ill * 100.0f, phase_name(phase),
         manual_mode ? "true" : "false", ip_str,
+        host, s_friendly_name, s_mac_suffix,
         p_curve_q1, p_curve_g1, p_curve_g3, p_curve_q3,
         p_brightness, p_face_gradient, p_floor, p_power_cap,
         p_glimmer_on ? "true" : "false",
@@ -2037,6 +2186,34 @@ static esp_err_t handle_reset_wifi(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Rename the lamp. Empty name (or a name that sanitizes to empty) reverts
+// to the MAC-derived default. mDNS hostname updates live; AP SSID applies
+// on the next AP-mode boot.
+static esp_err_t handle_name_set(httpd_req_t *req)
+{
+    if (!req_is_authed(req)) {
+        return send_redirect(req, "/debug/login", NULL);
+    }
+    char query[128] = {0};
+    char raw[64]    = {0};
+    char clean[32]  = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        httpd_query_key_value(query, "name", raw, sizeof(raw));
+    }
+    sanitize_friendly(raw, clean, sizeof(clean));
+
+    nvs_save_friendly_name(clean);
+    strncpy(s_friendly_name, clean, sizeof(s_friendly_name) - 1);
+    s_friendly_name[sizeof(s_friendly_name) - 1] = '\0';
+    mdns_refresh_hostname();
+
+    char hostname[48];
+    device_hostname(hostname, sizeof(hostname));
+    ESP_LOGI(TAG, "Renamed device to %s (input=\"%s\")", hostname, raw);
+    httpd_resp_send(req, hostname, strlen(hostname));
+    return ESP_OK;
+}
+
 // Nudge ota_task to run a check-and-update pass right now instead of
 // waiting for the next 6-hour cycle. Purely a convenience for testing —
 // the automatic cycle needs no interaction.
@@ -2113,6 +2290,7 @@ static void register_debug_routes(httpd_handle_t server)
 {
     httpd_uri_t routes[] = {
         { .uri="/",                 .method=HTTP_GET,  .handler=handle_landing      },
+        { .uri="/whoami",           .method=HTTP_GET,  .handler=handle_name_get     },
         { .uri="/debug",            .method=HTTP_GET,  .handler=handle_debug_root   },
         { .uri="/debug/login",      .method=HTTP_GET,  .handler=handle_login_get    },
         { .uri="/debug/login",      .method=HTTP_POST, .handler=handle_login_post   },
@@ -2123,6 +2301,7 @@ static void register_debug_routes(httpd_handle_t server)
         { .uri="/debug/params/save",.method=HTTP_GET,  .handler=handle_params_save  },
         { .uri="/debug/preview",    .method=HTTP_GET,  .handler=handle_preview      },
         { .uri="/debug/reset_wifi", .method=HTTP_GET,  .handler=handle_reset_wifi   },
+        { .uri="/debug/name",       .method=HTTP_GET,  .handler=handle_name_set     },
         { .uri="/debug/ota_check",  .method=HTTP_GET,  .handler=handle_ota_check    },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++)
@@ -2159,6 +2338,7 @@ static void start_webserver_ap(void)
     }
     httpd_uri_t ap_routes[] = {
         { .uri="/",                 .method=HTTP_GET,  .handler=handle_setup_root       },
+        { .uri="/whoami",           .method=HTTP_GET,  .handler=handle_name_get         },
         { .uri="/scan",             .method=HTTP_GET,  .handler=handle_scan             },
         { .uri="/setup",            .method=HTTP_POST, .handler=handle_setup_post       },
         { .uri="/setup_standalone", .method=HTTP_POST, .handler=handle_setup_standalone },
@@ -2189,6 +2369,16 @@ void app_main(void)
         nvs_flash_init();
     }
     nvs_load_params();
+    nvs_load_friendly_name();
+    compute_mac_suffix();
+    {
+        char hostname[48];
+        device_hostname(hostname, sizeof(hostname));
+        ESP_LOGI(TAG, "Device name: %s  (MAC suffix: %s%s%s)",
+                 hostname, s_mac_suffix,
+                 s_friendly_name[0] ? ", friendly=" : "",
+                 s_friendly_name[0] ? s_friendly_name : "");
+    }
 
     // LED strip — SK6812 RGBW, GRBW byte order on the wire.
     led_strip_config_t strip_config = {
