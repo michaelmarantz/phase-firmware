@@ -92,8 +92,8 @@
 #define BUTTON_HOLD_MS   3000
 
 // ── Debug portal credentials ───────────────────────────────
-#define DEBUG_USER       "REDACTED_DEBUG_USER"
-#define DEBUG_PASS       "REDACTED_DEBUG_PASS"
+#define DEBUG_USER       "lunar"
+#define DEBUG_PASS       "phase"
 
 // ── OTA (automatic over-the-air updates) ───────────────────
 // Every connected lamp silently polls OTA_DEFAULT_URL. The URL is a
