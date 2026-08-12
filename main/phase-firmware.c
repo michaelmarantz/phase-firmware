@@ -210,6 +210,12 @@ static char s_session_token[33];
 static char s_mac_suffix[8];      // e.g. "a94290"
 static char s_friendly_name[32];  // "" = fall back to MAC suffix
 
+// True while the lamp is in AP-provisioning / standalone mode (i.e., serving
+// its own Wi-Fi network). In that state the mDNS hostname is just "phase"
+// so a fresh user can always type `phase.local` after joining the AP —
+// uniqueness only matters on shared home networks. Flipped in app_main.
+static bool s_is_ap_mode = false;
+
 // ── Live params ────────────────────────────────────────────
 static float p_face_gradient = DEFAULT_FACE_GRADIENT;
 static float p_brightness    = DEFAULT_BRIGHTNESS;
@@ -1013,6 +1019,21 @@ static void button_task(void *arg)
 // mDNS
 // ──────────────────────────────────────────────────────────
 
+// Fill `out` with the mDNS hostname appropriate for the current mode:
+//   - AP / standalone: just "phase" (isolated network, uniqueness moot,
+//     user should always be able to hit `phase.local`)
+//   - STA:             "phase-<friendly>" or "phase-<mac>" (unique per
+//     device so multiple lamps can coexist on a shared network)
+static void active_mdns_hostname(char *out, size_t out_sz)
+{
+    if (s_is_ap_mode) {
+        strncpy(out, NAME_PREFIX, out_sz - 1);
+        out[out_sz - 1] = '\0';
+    } else {
+        device_hostname(out, out_sz);
+    }
+}
+
 static void mdns_setup(void)
 {
     esp_err_t err = mdns_init();
@@ -1021,7 +1042,7 @@ static void mdns_setup(void)
         return;
     }
     char hostname[48];
-    device_hostname(hostname, sizeof(hostname));
+    active_mdns_hostname(hostname, sizeof(hostname));
     mdns_hostname_set(hostname);
     mdns_instance_name_set(MDNS_INSTANCE);
     mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
@@ -1029,12 +1050,13 @@ static void mdns_setup(void)
 }
 
 // Re-apply the mDNS hostname without a full mDNS restart. Called after the
-// user renames the lamp via /debug/name so `phase-<newname>.local` starts
-// working immediately, without waiting for the next reboot.
+// user renames the lamp via /debug/name so the new URL starts working
+// immediately, without waiting for the next reboot. In AP mode this is a
+// no-op — hostname stays "phase" until the next reboot into STA mode.
 static void mdns_refresh_hostname(void)
 {
     char hostname[48];
-    device_hostname(hostname, sizeof(hostname));
+    active_mdns_hostname(hostname, sizeof(hostname));
     if (mdns_hostname_set(hostname) == ESP_OK) {
         ESP_LOGI(TAG, "mDNS hostname now http://%s.local/", hostname);
     }
@@ -1819,12 +1841,13 @@ static int read_post_body(httpd_req_t *req, char *buf, size_t buf_sz)
 // HTTP — handlers (AP mode)
 // ──────────────────────────────────────────────────────────
 
-// Open (no-auth) endpoint returning the current hostname (e.g. "phase-a94290")
-// so the setup page can display which lamp the client is talking to.
+// Open (no-auth) endpoint returning the currently-active mDNS hostname
+// (which is just "phase" in AP mode, "phase-<tag>" in STA mode) so the
+// setup / login page can display the URL the client should use.
 static esp_err_t handle_name_get(httpd_req_t *req)
 {
     char host[48];
-    device_hostname(host, sizeof(host));
+    active_mdns_hostname(host, sizeof(host));
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_send(req, host, strlen(host));
     return ESP_OK;
@@ -2423,6 +2446,7 @@ void app_main(void)
 
     if (!have_creds) {
         ESP_LOGI(TAG, "No saved Wi-Fi creds — entering AP provisioning mode.");
+        s_is_ap_mode = true;   // → mDNS hostname is just "phase.local" here
         s_anim_mode = ANIM_BOOT;
         wifi_init_ap();
         mdns_setup();
