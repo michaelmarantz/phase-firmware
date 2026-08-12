@@ -80,7 +80,7 @@
 // FW_VERSION is the single source of truth: the top-level CMakeLists
 // extracts it into PROJECT_VER, which lands in the app descriptor that
 // OTA uses for is-this-new comparisons. Bump it for every release.
-#define FW_VERSION       "edition00.3"
+#define FW_VERSION       "edition00.4"
 // AP_SSID and MDNS_HOSTNAME are BOTH suffixed at runtime with the
 // device's unique tag: either its MAC-derived hex (default) or the
 // user's friendly name set via /debug. Final forms look like
@@ -104,7 +104,7 @@
 // spare OTA slot and reboots into it. The URL can be overridden per
 // device via NVS key "ota_url" (namespace "phase") for testing against
 // a local server.
-#define OTA_DEFAULT_URL        "https://github.com/michaelmarantz/phase-firmware/releases/latest/download/phase.bin"
+#define OTA_DEFAULT_URL        "https://github.com/lunarobjects/phase-firmware/releases/latest/download/phase.bin"
 #define OTA_FIRST_CHECK_DELAY_MS  (30 * 1000)          // settle after boot
 #define OTA_CHECK_INTERVAL_MS     (6 * 60 * 60 * 1000) // then every 6 h
 #define OTA_HTTP_TIMEOUT_MS       (15 * 1000)

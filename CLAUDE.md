@@ -34,7 +34,7 @@ Every lamp gets a unique name so multiple units can coexist on one network.
 
 ## OTA updates (edition00.1+)
 
-The fleet follows the **latest GitHub release** of this repo. Each STA-connected lamp checks `https://github.com/michaelmarantz/phase-firmware/releases/latest/download/phase.bin` ~30 s after boot and every 6 h, compares the image's app-descriptor version to its own, and on any difference downloads into the spare OTA slot and reboots. Fully silent — no user consent step anywhere.
+The fleet follows the **latest GitHub release** of this repo. Each STA-connected lamp checks `https://github.com/lunarobjects/phase-firmware/releases/latest/download/phase.bin` ~30 s after boot and every 6 h, compares the image's app-descriptor version to its own, and on any difference downloads into the spare OTA slot and reboots. Fully silent — no user consent step anywhere.
 
 - **Publish an update:** bump `FW_VERSION`, commit, run `./release.sh` (builds, size-checks against the OTA slot, tags, `gh release create` with `phase.bin`). Repo/releases must stay publicly downloadable.
 - **Partition table** is custom (`partitions.csv`). On edition00.2 the layout is `nvs` + `phy_init` at their original offsets (creds/params survive the first serial reflash from any prior single-app build), then `otadata` + two **1.9375 MB** `ota_0`/`ota_1` slots fill the 4 MB chip. Roughly 2× the headroom of the edition00.1 layout — the sdkconfig no longer has to trim features to fit.
