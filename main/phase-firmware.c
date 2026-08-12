@@ -1061,6 +1061,32 @@ static void mdns_setup(void)
     mdns_instance_name_set(MDNS_INSTANCE);
     mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
     ESP_LOGI(TAG, "mDNS up — http://%s.local/", hostname);
+
+    // In STA mode, also advertise the plain "phase" hostname as a delegate
+    // pointing to this lamp's IP. Multiple lamps on the same network all
+    // do this; clients typing "phase.local" get whichever lamp answers
+    // first. That lamp's landing page then runs a peer-lamp scan via
+    // /lamps and either auto-redirects (single-lamp households — the
+    // seamless case) or shows a chooser. Single primary hostname stays
+    // unique so bookmarked "phase-<tag>.local" URLs still work directly.
+    if (!s_is_ap_mode) {
+        esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        esp_netif_ip_info_t ip_info;
+        if (sta && esp_netif_get_ip_info(sta, &ip_info) == ESP_OK &&
+            ip_info.ip.addr != 0) {
+            mdns_ip_addr_t addr = {0};
+            addr.addr.type = ESP_IPADDR_TYPE_V4;
+            addr.addr.u_addr.ip4.addr = ip_info.ip.addr;
+            addr.next = NULL;
+            esp_err_t d = mdns_delegate_hostname_add(NAME_PREFIX, &addr);
+            if (d == ESP_OK) {
+                ESP_LOGI(TAG, "mDNS delegate up — http://%s.local/ also reaches this lamp",
+                         NAME_PREFIX);
+            } else {
+                ESP_LOGW(TAG, "mDNS delegate add failed: %s", esp_err_to_name(d));
+            }
+        }
+    }
 }
 
 // Re-apply the mDNS hostname without a full mDNS restart. Called after the
@@ -1482,14 +1508,43 @@ static const char *SETUP_PAGE =
 static const char *LANDING_PAGE =
 "<!DOCTYPE html><html><head>"
 "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-"<meta http-equiv='refresh' content='0;url=/debug'>"
 "<title>Phase</title>"
-"<style>" PHASE_STYLE "</style></head><body><div class='card'>"
+"<style>" PHASE_STYLE
+"ul.lamp-list{list-style:none;padding:0;margin:0}"
+"ul.lamp-list li{margin-bottom:8px}"
+"ul.lamp-list a{display:block;padding:14px;border:1px solid #333;"
+"background:transparent;color:#e8e0d0;text-decoration:none;font-family:inherit;"
+"font-size:13px;letter-spacing:.15em;border-radius:2px;transition:all .2s}"
+"ul.lamp-list a:hover{border-color:#e8e0d0;background:#1a1a1a}"
+"ul.lamp-list a.self{border-color:#e8e0d0}"
+"</style></head><body><div class='card'>"
 "<h1>Lunar Objects &mdash; Phase</h1>"
 "<div class='phase-display'>"
-"<div class='phase-name'>online.</div>"
-"<div class='phase-pct'>→ /debug</div>"
-"</div></div></body></html>";
+"<div class='phase-name' id='ldg-title'>Discovering…</div>"
+"<div class='phase-pct' id='ldg-sub'>scanning your network for lamps</div>"
+"</div>"
+"<ul class='lamp-list' id='lamp-list' style='display:none'></ul>"
+"<div class='note' id='ldg-note' style='display:none'>Bookmark the one you use most — this chooser only appears when several lamps are on the network.</div>"
+"<script>"
+"fetch('/lamps').then(function(r){return r.json();}).then(function(d){"
+"var lamps=(d.lamps||[]);var self=d.self||'';"
+"var others=lamps.filter(function(l){return l.host!==self;});"
+"if(others.length===0){location.replace('/debug');return;}"
+"document.getElementById('ldg-title').textContent='Which lamp?';"
+"document.getElementById('ldg-sub').textContent=lamps.length+' Phase lamps on this network';"
+"var ul=document.getElementById('lamp-list');ul.style.display='block';"
+"document.getElementById('ldg-note').style.display='block';"
+"lamps.sort(function(a,b){return a.host.localeCompare(b.host);});"
+"lamps.forEach(function(l){"
+"var li=document.createElement('li');"
+"var a=document.createElement('a');"
+"a.href='http://'+l.host+'.local/debug';"
+"a.textContent=l.host+(l.host===self?'  ← this one':'');"
+"if(l.host===self)a.className='self';"
+"li.appendChild(a);ul.appendChild(li);"
+"});"
+"}).catch(function(){location.replace('/debug');});"
+"</script></div></body></html>";
 
 // ───── Debug login page ─────
 static const char *LOGIN_PAGE =
@@ -1864,6 +1919,69 @@ static esp_err_t handle_name_get(httpd_req_t *req)
     active_mdns_hostname(host, sizeof(host));
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_send(req, host, strlen(host));
+    return ESP_OK;
+}
+
+// Scan the local mDNS network for peer Phase lamps and return a JSON list
+// of them. Used by the landing page (STA only) to decide whether to
+// auto-redirect to /debug (0–1 results) or show a chooser (2+). Blocking
+// scan — takes up to ~1500 ms.
+static esp_err_t handle_lamps_scan(httpd_req_t *req)
+{
+    char self_host[48];
+    active_mdns_hostname(self_host, sizeof(self_host));
+    char self_tag[32];
+    if (s_friendly_name[0]) {
+        strncpy(self_tag, s_friendly_name, sizeof(self_tag) - 1);
+    } else {
+        strncpy(self_tag, s_mac_suffix, sizeof(self_tag) - 1);
+    }
+    self_tag[sizeof(self_tag) - 1] = '\0';
+
+    mdns_result_t *results = NULL;
+    esp_err_t qerr = mdns_query_ptr("_http", "_tcp", 1500, 16, &results);
+    (void)qerr;   // failure is OK — we just return an empty list
+
+    char *buf = malloc(3072);
+    if (!buf) {
+        if (results) mdns_query_results_free(results);
+        return ESP_ERR_NO_MEM;
+    }
+    int off = snprintf(buf, 3072, "{\"self\":\"%s\",\"lamps\":[", self_host);
+
+    int count = 0;
+    for (mdns_result_t *r = results; r != NULL; r = r->next) {
+        // Filter: only entries whose hostname starts with our NAME_PREFIX.
+        if (!r->hostname) continue;
+        if (strncmp(r->hostname, NAME_PREFIX, strlen(NAME_PREFIX)) != 0) continue;
+
+        char ip_str[16] = "";
+        if (r->addr) {
+            mdns_ip_addr_t *a = r->addr;
+            while (a) {
+                if (a->addr.type == ESP_IPADDR_TYPE_V4) {
+                    snprintf(ip_str, sizeof(ip_str), IPSTR,
+                             IP2STR(&a->addr.u_addr.ip4));
+                    break;
+                }
+                a = a->next;
+            }
+        }
+        if (off < (int)(3072 - 160)) {
+            off += snprintf(buf + off, 3072 - off,
+                "%s{\"host\":\"%s\",\"ip\":\"%s\"}",
+                count == 0 ? "" : ",",
+                r->hostname,
+                ip_str);
+            count++;
+        }
+    }
+    off += snprintf(buf + off, 3072 - off, "]}");
+    if (results) mdns_query_results_free(results);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, off);
+    free(buf);
     return ESP_OK;
 }
 
@@ -2339,6 +2457,7 @@ static void register_debug_routes(httpd_handle_t server)
     httpd_uri_t routes[] = {
         { .uri="/",                 .method=HTTP_GET,  .handler=handle_landing      },
         { .uri="/whoami",           .method=HTTP_GET,  .handler=handle_name_get     },
+        { .uri="/lamps",            .method=HTTP_GET,  .handler=handle_lamps_scan   },
         { .uri="/debug",            .method=HTTP_GET,  .handler=handle_debug_root   },
         { .uri="/debug/login",      .method=HTTP_GET,  .handler=handle_login_get    },
         { .uri="/debug/login",      .method=HTTP_POST, .handler=handle_login_post   },
