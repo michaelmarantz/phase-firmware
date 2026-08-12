@@ -587,6 +587,20 @@ static void compute_moon_frame(float phase, float time_f, float breath_t)
         edge_fade = 1.0f - es;
     }
 
+    // Crescent-tip glimmer taper: on thin crescents (lit_fraction < ~0.2)
+    // only 1–2 pixels sit in the gradient zone, and each has edge_proximity
+    // near 1.0. With a high p_glimmer_edge that pushes glimmer amount past
+    // 1.0, those few pixels get clipped to 0 at troughs and read as
+    // *blinking* rather than shimmering. Scale edge_proximity down at low
+    // lit_fraction so the effect fades in with the crescent. Symmetric —
+    // same taper applies to the waning-crescent side because lit_fraction
+    // is symmetric around full moon.
+    float crescent_scale = 1.0f;
+    if (lit_fraction < 0.20f) {
+        float t = lit_fraction / 0.20f;
+        crescent_scale = t * t * (3.0f - 2.0f * t);   // smoothstep(0..1)
+    }
+
     // Global breath modulation. Amplitude scales with lit_fraction so it's
     // imperceptible at crescent phases but provides quiet life at full.
     // Period ~6 s.
@@ -620,7 +634,7 @@ static void compute_moon_frame(float phase, float time_f, float breath_t)
             // so the rotation that would otherwise appear during the
             // lit_center flip becomes invisible.
             brightness     = edge_fade * soft_b + (1.0f - edge_fade);
-            edge_proximity = edge_fade * (1.0f - fabsf(t));
+            edge_proximity = edge_fade * crescent_scale * (1.0f - fabsf(t));
         }
 
         if (p_glimmer_on && brightness > 0.01f)
