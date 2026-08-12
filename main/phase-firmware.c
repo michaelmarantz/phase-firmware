@@ -2,7 +2,8 @@
 //  Phase firmware — edition00
 //
 //  Hardware:
-//    SK6812 RGBW × 138 on GPIO 8, reset button on GPIO 7 (silkscreen D5).
+//    SK6812 RGBW × 138 on GPIO 5 (silkscreen D3), reset button on GPIO 7
+//    (silkscreen D5).
 //    LED 0 sits at 12 o'clock; indices advance clockwise.
 //    Only the W channel is driven for normal moon rendering; the B channel
 //    is used for the boot-AP and Wi-Fi-connecting animations.
@@ -60,12 +61,15 @@
 #include "esp_crt_bundle.h"
 
 // ── Hardware ───────────────────────────────────────────────
-// LED_GPIO was originally 21, but on the v1 phase board the GPIO 21 trace
-// to the strip's DIN doesn't pass signal — confirmed by swapping to GPIO 8
-// with WLED, which then drove the strip. GPIO 8 is a strapping pin (boot
-// log enable); fine for runtime use, but for the next board respin route
-// data through GPIO 3/4/5/6/7/10 instead — those are clean.
-#define LED_GPIO         8
+// LED_GPIO: chip GPIO 5 — silkscreen label D3 on this board (Xiao-style
+// ESP32-C3 pinout: D3=GPIO5, D5=GPIO7, D8=GPIO8, and so on).
+// Chosen because it's a fully clean pin — no strapping, no UART, no USB,
+// no flash — so there's no chance of an SK6812 pull-down interfering at
+// boot the way GPIO 8 (a strapping pin) theoretically could.
+// History: v1 board originally targeted GPIO 21 (broken trace); switched
+// to GPIO 8 as a workaround; hand-soldered prototypes are now routed to
+// GPIO 5 as the production choice.
+#define LED_GPIO         5
 #define BUTTON_GPIO      7   // labelled D5 on the phase board silkscreen
                              // (D-labels on this board are not direct
                              // GPIO numbers — confirmed via runtime scan)
@@ -628,8 +632,14 @@ static void compute_moon_frame(float phase, float time_f, float breath_t)
 // Just a smooth sin² illumination sweep that follows the moon-phase shape.
 static void compute_boot_frame(float boot_phase)
 {
-    // sin²(phase·π) gives 0 → 1 → 0 over phase 0 → 1, smooth at both ends.
-    float s        = sinf(boot_phase * (float)M_PI);
+    // sin²(phase·π) gives 0 → 1 → 0 over phase 0 → 1. Compressing the
+    // effective input to [0.08, 0.92] means ill never falls below ~6%,
+    // so lit_arc stays ≥ ~22° (~8 pixels wide) at both ends of the cycle.
+    // Without this floor the crescent at cycle boundaries is <1 pixel wide
+    // and appears as visible per-pixel popping — the stutter you saw on
+    // the boot AP animation and the Preview cycle.
+    float t        = 0.08f + boot_phase * 0.84f;
+    float s        = sinf(t * (float)M_PI);
     float ill      = s * s;
     float lit_arc  = ill * 360.0f;
 

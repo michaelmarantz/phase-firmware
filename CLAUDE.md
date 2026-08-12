@@ -5,7 +5,7 @@ ESP-IDF firmware for the Phase lamp — an ESP32-C3 driving a ring of addressabl
 ## Hardware (edition00)
 
 - **MCU:** ESP32-C3 (RISC-V, single-core, 4 MB flash — the SPI chip was always 4 MB, we just told ESP-IDF "2 MB" through edition00.1 by mistake)
-- **LEDs:** 138× **SK6812 RGBW** on **GPIO 8**, GRBW byte order, driven via RMT at 10 MHz
+- **LEDs:** 138× **SK6812 RGBW** on **GPIO 5** (silkscreen **D3** — Xiao-style pinout: D3→GPIO5), GRBW byte order, driven via RMT at 10 MHz. Historically ran on GPIO 8/D8 during v1 phase-board bring-up; hand-soldered prototypes moved to GPIO 5 because 8 is a strapping pin.
 - LED 0 sits at **12 o'clock**; indices advance clockwise (`led_angle(i) = i * 360 / 138`)
 - **Color:** W channel only for moon rendering (R=G=B=0); B channel used for boot AP + Wi-Fi-connecting animations
 - **Reset button:** chip **GPIO 7** (silkscreen label **D5** on the phase board), active-low, internal pull-up. Hold 3 s to erase Wi-Fi creds and reboot. **Note:** the silkscreen D-numbers on this board are NOT direct GPIO numbers — confirmed by a runtime GPIO scanner. (LED data D8 happens to equal GPIO 8 by coincidence; D5 is GPIO 7.) Always verify any new wiring with the scanner before assuming the label matches.
