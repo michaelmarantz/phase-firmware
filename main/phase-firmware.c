@@ -632,14 +632,8 @@ static void compute_moon_frame(float phase, float time_f, float breath_t)
 // Just a smooth sin² illumination sweep that follows the moon-phase shape.
 static void compute_boot_frame(float boot_phase)
 {
-    // sin²(phase·π) gives 0 → 1 → 0 over phase 0 → 1. Compressing the
-    // effective input to [0.08, 0.92] means ill never falls below ~6%,
-    // so lit_arc stays ≥ ~22° (~8 pixels wide) at both ends of the cycle.
-    // Without this floor the crescent at cycle boundaries is <1 pixel wide
-    // and appears as visible per-pixel popping — the stutter you saw on
-    // the boot AP animation and the Preview cycle.
-    float t        = 0.08f + boot_phase * 0.84f;
-    float s        = sinf(t * (float)M_PI);
+    // sin²(phase·π) gives 0 → 1 → 0 over phase 0 → 1, smooth at both ends.
+    float s        = sinf(boot_phase * (float)M_PI);
     float ill      = s * s;
     float lit_arc  = ill * 360.0f;
 
