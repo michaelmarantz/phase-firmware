@@ -564,16 +564,19 @@ static void compute_moon_frame(float phase, float time_f, float breath_t)
     float fade = ft * ft * (3.0f - 2.0f * ft);     // smoothstep(0,1,lit_fraction)
     float face_grad_eff = p_face_gradient * (1.0f - fade);
 
-    // Edge fade: kill the soft terminator + edge-glimmer multiplier as we
-    // approach full moon. Both are anchored to lit_center, and at high
-    // lit_fraction the gradient zone covers ~half the ring — so as
-    // lit_center swings 90° → 270° during the flip, the whole pattern
-    // visibly rotated. Window 0.55 → 0.85 means the edge has fully faded
-    // before the flip window opens (phase 0.46–0.54 → lit_fraction 0.88+).
+    // Edge fade: hide the lit_center 180° rotation by filling the
+    // gradient zone toward full brightness. Previously tied to
+    // lit_fraction (activated at ~0.55, fully faded by ~0.85), which
+    // made the moon *look* fully lit for the ~3-day range where
+    // lit_fraction > 0.85 — a much longer "full moon" than reality.
+    // Now tied to the SAME flip window as lit_center (phase ±0.04
+    // around full). Outside the flip window: edge_fade = 1.0, normal
+    // soft terminator visible, gibbous looks gibbous. Inside: fades
+    // to 0 at exact full moon, hiding the rotation.
+    float phase_from_half = fabsf(phase - 0.5f);
     float edge_fade = 1.0f;
-    if (lit_fraction > 0.55f) {
-        float et = (lit_fraction - 0.55f) / 0.30f;
-        if (et > 1.0f) et = 1.0f;
+    if (phase_from_half < flip_window) {
+        float et = 1.0f - (phase_from_half / flip_window);
         float es = et * et * (3.0f - 2.0f * et);
         edge_fade = 1.0f - es;
     }
@@ -632,9 +635,12 @@ static void compute_moon_frame(float phase, float time_f, float breath_t)
 // Just a smooth sin² illumination sweep that follows the moon-phase shape.
 static void compute_boot_frame(float boot_phase)
 {
-    // sin²(phase·π) gives 0 → 1 → 0 over phase 0 → 1, smooth at both ends.
+    // sin(phase·π) gives 0 → 1 → 0 over phase 0 → 1. NOT squared: sin²
+    // has zero velocity at both endpoints so the growing crescent hangs
+    // on the first/last pixel for several seconds. Plain sin has finite
+    // velocity there, so pixels roll in and out at a steady cadence.
     float s        = sinf(boot_phase * (float)M_PI);
-    float ill      = s * s;
+    float ill      = s;
     float lit_arc  = ill * 360.0f;
 
     float lit_center;
@@ -662,14 +668,15 @@ static void compute_boot_frame(float boot_phase)
     float fade = ill * ill * (3.0f - 2.0f * ill);
     float face_grad_eff = BOOT_FACE_GRADIENT * (1.0f - fade);
 
-    // Edge fade — kill the soft terminator as the sweep approaches its peak.
-    // Without this the gradient zone (which covers ~half the ring at high
-    // illumination) visibly rotates with lit_center during the flip.
-    // Mirrors the same logic in compute_moon_frame.
+    // Edge fade — hide the lit_center 180° rotation by filling the
+    // gradient zone toward full brightness during the flip. Tied to the
+    // SAME flip window as lit_center (phase ±0.04) rather than ill,
+    // so the "essentially full" plateau is short — mirrors the same
+    // fix applied to compute_moon_frame.
+    float boot_phase_from_half = fabsf(boot_phase - 0.5f);
     float edge_fade = 1.0f;
-    if (ill > 0.55f) {
-        float et = (ill - 0.55f) / 0.30f;
-        if (et > 1.0f) et = 1.0f;
+    if (boot_phase_from_half < flip_window) {
+        float et = 1.0f - (boot_phase_from_half / flip_window);
         float es = et * et * (3.0f - 2.0f * et);
         edge_fade = 1.0f - es;
     }
