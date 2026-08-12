@@ -47,7 +47,7 @@ BIN=build/phase-prototype.bin
 
 # Sanity: the binary must fit the 960 KB OTA slot with a little margin.
 SIZE=$(stat -f%z "$BIN" 2>/dev/null || stat -c%s "$BIN")
-SLOT=$((0xF0000))
+SLOT=$((0x1F0000))   # 4 MB layout: two 1.9375 MB OTA slots (edition00.2+)
 echo "Binary: $SIZE bytes (slot $SLOT)"
 if [ "$SIZE" -ge "$SLOT" ]; then
     echo "ERROR: binary does not fit the OTA slot — trim before releasing."; exit 1
